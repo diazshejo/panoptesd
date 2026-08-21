@@ -1,0 +1,43 @@
+[Unit]
+Description=panoptesd - deteccion de anomalias en procesos del sistema
+After=network.target
+Documentation=https://example.internal/panoptesd
+
+[Service]
+Type=simple
+ExecStart=/opt/panoptesd/panoptesd --config /etc/panoptesd/config.toml
+
+# Necesita leer /proc de todos los procesos (incluyendo de otros usuarios)
+# y ejecutar el script de auditoria con privilegios para inspeccionar
+# cualquier proceso del sistema.
+User=root
+
+# Reinicio automatico ante caidas, con backoff para no entrar en loop
+# de crash agresivo si algo esta mal configurado.
+Restart=on-failure
+RestartSec=5s
+
+# Logging: stdout/stderr van a journald (ademas del log_file opcional
+# que el propio binario puede escribir segun config.toml).
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=panoptesd
+
+# Señal de parada limpia: el binario maneja SIGTERM para drenar la cola
+# de auditoria y salir ordenadamente.
+KillSignal=SIGTERM
+TimeoutStopSec=30s
+
+# --- Hardening moderado ---
+# No se usa ProtectSystem=strict / ProtectHome ni sandboxing agresivo de
+# filesystem porque el daemon necesita leer /proc de cualquier proceso y
+# el script de auditoria puede necesitar escribir logs y ejecutar
+# herramientas del sistema (ps, ss, lsof) sin restricciones. Se aplican
+# solo las protecciones que no interfieren con esa necesidad.
+NoNewPrivileges=true
+ProtectKernelTunables=true
+ProtectControlGroups=true
+LockPersonality=true
+
+[Install]
+WantedBy=multi-user.target

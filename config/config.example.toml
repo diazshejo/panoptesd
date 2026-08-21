@@ -1,0 +1,74 @@
+# Configuracion de ejemplo para panoptesd.
+# Copiar a /etc/panoptesd/config.toml y ajustar segun el servidor.
+
+# Intervalo de polling, en segundos. Valores mas bajos detectan mas rapido
+# pero consumen mas CPU; 5s es un buen balance para un server de proposito
+# general.
+poll_interval_secs = 5
+
+# Nivel de log: "trace" | "debug" | "info" | "warn" | "error"
+log_level = "info"
+
+# Archivo de log adicional (ademas de stdout, que systemd captura en
+# journald). Comentar/omitir para loguear solo a stdout.
+log_file = "/var/log/panoptesd/panoptesd.log"
+
+# Script bash que se ejecuta ante cada anomalia detectada.
+audit_script_path = "/opt/panoptesd/scripts/auditoria.sh"
+
+# Cooldown en segundos: no se vuelve a disparar el mismo (pid, tipo de
+# anomalia) dentro de esta ventana.
+cooldown_secs = 300
+
+# Hilos del pool que ejecutan el script de auditoria (no bloquean el loop
+# de monitoreo). 2 alcanza para la mayoria de los casos.
+script_worker_threads = 2
+
+[rules.cpu]
+enabled = true
+# %CPU (puede superar 100 en procesos multi-hilo/multi-core).
+threshold_percent = 85.0
+# Debe mantenerse sostenido por esta cantidad de segundos (no un pico).
+sustained_secs = 60
+
+[rules.memory]
+enabled = true
+# RSS maximo esperado por proceso, en MB.
+max_rss_mb = 2048
+
+[rules.root_whitelist]
+enabled = true
+# Nombres de proceso (comm, tal como aparece en /proc/<pid>/stat, max 15
+# caracteres del lado del kernel) permitidos para correr como root.
+allowed_names = [
+    "systemd",
+    "sshd",
+    "cron",
+    "crond",
+    "rsyslogd",
+    "systemd-journal",
+    "systemd-udevd",
+    "systemd-logind",
+    "dbus-daemon",
+    "NetworkManager",
+    "panoptesd",
+]
+
+[rules.ephemeral]
+enabled = true
+# Si un proceso vive menos de esta cantidad de segundos se considera
+# sospechoso (posible cryptominer/malware que se relanza para evadir
+# deteccion).
+max_lifetime_secs = 2
+
+[network]
+# La correlacion de sockets recorre los fds de todos los procesos: es la
+# regla mas costosa. Se deja deshabilitada por defecto.
+enabled = false
+# Cada cuantos ciclos de polling se hace la correlacion (si esta habilitada).
+check_every_n_cycles = 6
+# Puertos remotos considerados normales (a cualquier IP).
+allowed_remote_ports = [80, 443, 53, 123]
+# Rangos IPv4 esperados (notacion CIDR). Conexiones fuera de estos rangos
+# y de allowed_remote_ports se consideran anomalas.
+allowed_cidrs_v4 = ["10.0.0.0/8", "192.168.0.0/16", "127.0.0.0/8"]

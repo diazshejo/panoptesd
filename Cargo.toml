@@ -1,0 +1,49 @@
+[package]
+name = "panoptesd"
+version = "0.1.0"
+edition = "2021"
+description = "panoptesd - daemon de monitoreo de procesos con deteccion de anomalias para Linux"
+license = "MIT"
+
+[[bin]]
+name = "panoptesd"
+path = "src/main.rs"
+
+[dependencies]
+# Configuracion
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
+
+# Manejo de errores de arranque (config invalida, script inexistente, etc).
+# Crate minimalista, sin macros proc pesadas ni dependencias transitivas
+# grandes; solo se usa en el camino de inicializacion, no en el loop caliente.
+anyhow = "1"
+
+# Logging (stdout compatible con journald + archivo opcional)
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+tracing-appender = "0.2"
+
+# Manejo de señales (SIGTERM/SIGINT) para shutdown limpio
+signal-hook = "0.3"
+
+# sysconf(_SC_CLK_TCK) / sysconf(_SC_PAGESIZE): valores reales del kernel,
+# en vez de asumir 100 ticks/seg y paginas de 4KiB. Es un binding FFI muy
+# liviano (sin runtime propio), no un framework, asi que no compromete el
+# objetivo de "sin dependencias pesadas".
+libc = "0.2"
+
+# Nota deliberada: NO se usa `procfs` ni `sysinfo`.
+# Ambos crates son excelentes para uso general, pero para este daemon
+# el parseo manual de /proc (solo los campos que realmente necesitamos:
+# comm/utime/stime/rss de /proc/<pid>/stat, y el uid via metadata del
+# propio directorio /proc/<pid>) evita capas de abstraccion multiplataforma
+# y allocaciones de campos que no usamos en cada tick. Con procesos
+# reevaluados cada N segundos, el parseo manual con buffers reutilizados
+# es la opcion mas liviana en CPU/memoria.
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+strip = true
