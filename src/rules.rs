@@ -14,6 +14,12 @@ pub enum AnomalyKind {
     RootNotWhitelisted,
     EphemeralProcess,
     UnexpectedNetwork,
+    /// No es una anomalia real: la auditoria de rutina que dispara el
+    /// scheduler semanal de Telegram. Comparte el mismo tipo para poder
+    /// viajar por el mismo `TriggerJob`/pool de workers/historial que las
+    /// anomalias de verdad, pero se excluye explicitamente de los conteos
+    /// de "anomalias detectadas" en los reportes.
+    ScheduledAudit,
 }
 
 impl AnomalyKind {
@@ -24,7 +30,15 @@ impl AnomalyKind {
             AnomalyKind::RootNotWhitelisted => "root_not_whitelisted",
             AnomalyKind::EphemeralProcess => "ephemeral_process",
             AnomalyKind::UnexpectedNetwork => "unexpected_network",
+            AnomalyKind::ScheduledAudit => "scheduled_weekly_audit",
         }
+    }
+
+    /// False para `ScheduledAudit`: es mantenimiento de rutina, no una
+    /// deteccion. Los reportes de status/resumen usan esto para no contar
+    /// la auditoria programada como si fuera una anomalia.
+    pub fn is_real_anomaly(&self) -> bool {
+        !matches!(self, AnomalyKind::ScheduledAudit)
     }
 }
 

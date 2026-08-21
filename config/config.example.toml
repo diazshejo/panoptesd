@@ -72,3 +72,33 @@ allowed_remote_ports = [80, 443, 53, 123]
 # Rangos IPv4 esperados (notacion CIDR). Conexiones fuera de estos rangos
 # y de allowed_remote_ports se consideran anomalas.
 allowed_cidrs_v4 = ["10.0.0.0/8", "192.168.0.0/16", "127.0.0.0/8"]
+
+[telegram]
+# Habilita las tres notificaciones por Telegram: alerta inmediata de
+# anomalia, status periodico y resumen semanal de auditoria.
+#
+# El token del bot y el chat_id NUNCA van en este archivo: se leen de las
+# variables de entorno TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID (ver
+# systemd/panoptesd.service, EnvironmentFile). Si enabled=true pero las
+# variables no estan seteadas, el daemon arranca igual y solo loguea un
+# error: Telegram queda deshabilitado para esa corrida.
+enabled = false
+
+# Cada cuantas horas se envia el reporte de status (uptime, CPU, memoria,
+# disco, procesos vigilados y anomalias de las ultimas 12h).
+status_interval_hours = 12
+
+# Dia y hora (UTC) del resumen semanal de auditoria. Dia en ingles,
+# minusculas: "sunday", "monday", "tuesday", "wednesday", "thursday",
+# "friday", "saturday".
+weekly_summary_day = "sunday"
+weekly_summary_hour = 23
+
+# Particiones a reportar en el status periodico (uso de disco).
+disk_paths = ["/"]
+
+# Timeout (segundos) de las llamadas HTTP a la API de Telegram. Si se
+# supera, el envio falla y solo se loguea: nunca bloquea el loop principal
+# de monitoreo (las llamadas corren en los workers de auditoria y en los
+# hilos de los schedulers, nunca en el loop de /proc).
+request_timeout_secs = 5

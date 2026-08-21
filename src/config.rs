@@ -32,6 +32,9 @@ pub struct Config {
 
     #[serde(default)]
     pub network: NetworkConfig,
+
+    #[serde(default)]
+    pub telegram: TelegramConfig,
 }
 
 fn default_log_level() -> String {
@@ -116,6 +119,88 @@ impl Default for NetworkConfig {
 
 fn default_network_every() -> u64 {
     5
+}
+
+#[derive(Debug, Deserialize, Clone)]
+pub struct TelegramConfig {
+    /// El token y el chat_id NUNCA van aca: se leen de las variables de
+    /// entorno TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID (via EnvironmentFile
+    /// de systemd), para no dejar secretos en el repo ni en el archivo de
+    /// config en texto plano.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Cada cuantas horas se envia el reporte de status.
+    #[serde(default = "default_status_interval_hours")]
+    pub status_interval_hours: u64,
+    /// Dia (en ingles, minusculas) en que se envia el resumen semanal.
+    #[serde(default = "default_weekly_day")]
+    pub weekly_summary_day: String,
+    /// Hora UTC (0-23) del resumen semanal.
+    #[serde(default = "default_weekly_hour")]
+    pub weekly_summary_hour: u8,
+    /// Paths de particiones a reportar en el status (ej "/", "/var").
+    #[serde(default = "default_disk_paths")]
+    pub disk_paths: Vec<String>,
+    /// Timeout (segundos) de las llamadas HTTP a la API de Telegram.
+    #[serde(default = "default_telegram_timeout")]
+    pub request_timeout_secs: u64,
+}
+
+impl Default for TelegramConfig {
+    fn default() -> Self {
+        TelegramConfig {
+            enabled: false,
+            status_interval_hours: default_status_interval_hours(),
+            weekly_summary_day: default_weekly_day(),
+            weekly_summary_hour: default_weekly_hour(),
+            disk_paths: default_disk_paths(),
+            request_timeout_secs: default_telegram_timeout(),
+        }
+    }
+}
+
+fn default_status_interval_hours() -> u64 {
+    12
+}
+
+fn default_weekly_day() -> String {
+    "sunday".to_string()
+}
+
+fn default_weekly_hour() -> u8 {
+    23
+}
+
+fn default_disk_paths() -> Vec<String> {
+    vec!["/".to_string()]
+}
+
+fn default_telegram_timeout() -> u64 {
+    5
+}
+
+impl TelegramConfig {
+    /// Convierte `weekly_summary_day` a un numero de dia de la semana
+    /// (0=domingo..6=sabado, la misma convencion que `tm_wday` de libc).
+    /// Dia invalido en la config -> domingo, con un warning al cargar.
+    pub fn weekly_summary_weekday(&self) -> i32 {
+        match self.weekly_summary_day.to_lowercase().as_str() {
+            "sunday" | "domingo" => 0,
+            "monday" | "lunes" => 1,
+            "tuesday" | "martes" => 2,
+            "wednesday" | "miercoles" | "miércoles" => 3,
+            "thursday" | "jueves" => 4,
+            "friday" | "viernes" => 5,
+            "saturday" | "sabado" | "sábado" => 6,
+            other => {
+                tracing::warn!(
+                    day = other,
+                    "weekly_summary_day invalido, usando domingo por defecto"
+                );
+                0
+            }
+        }
+    }
 }
 
 impl Config {

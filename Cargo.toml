@@ -33,6 +33,10 @@ signal-hook = "0.3"
 # objetivo de "sin dependencias pesadas".
 libc = "0.2"
 
+# Cliente HTTP sincrono minimo (sin runtime async) para la API de Telegram.
+# TLS via rustls (feature por defecto), sin depender de OpenSSL del sistema.
+ureq = "2"
+
 # Nota deliberada: NO se usa `procfs` ni `sysinfo`.
 # Ambos crates son excelentes para uso general, pero para este daemon
 # el parseo manual de /proc (solo los campos que realmente necesitamos:

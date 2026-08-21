@@ -5,7 +5,9 @@ consumo de CPU/memoria. Corre en polling (sin `tokio`, sin async), lee
 `/proc` a mano, y dispara un script bash de auditoria configurable cuando
 detecta comportamiento anomalo (CPU sostenida, memoria fuera de rango,
 procesos root fuera de whitelist, conexiones de red inesperadas, o procesos
-efimeros tipo cryptominer).
+efimeros tipo cryptominer). Opcionalmente notifica todo por Telegram: alerta
+inmediata por anomalia, status del servidor cada 12h, y resumen semanal de
+auditoria.
 
 ## Estructura del proyecto
 
@@ -21,7 +23,12 @@ panoptesd/
 │   ├── network.rs       # correlacion opcional de sockets (/proc/net/tcp)
 │   ├── userdb.rs        # cache uid -> username (/etc/passwd)
 │   ├── signals.rs       # SIGTERM/SIGINT y sleep interrumpible
-│   └── logging.rs       # tracing a stdout (journald) + archivo opcional
+│   ├── logging.rs       # tracing a stdout (journald) + archivo opcional
+│   ├── telegram.rs      # cliente ureq + formateo de los 3 tipos de mensaje
+│   ├── scheduler.rs     # hilos nativos: status cada 12h y resumen semanal
+│   ├── hoststats.rs     # uptime/CPU/memoria/disco del servidor (/proc, statvfs)
+│   ├── history.rs       # historial en memoria de auditorias (para status/resumen)
+│   └── timefmt.rs       # timestamps UTC via libc, sin crate de fechas
 ├── config/
 │   └── config.example.toml
 ├── scripts/
@@ -84,7 +91,17 @@ sudo chmod +x /opt/panoptesd/scripts/auditoria.sh
 # 5. Crear directorios de logs
 sudo mkdir -p /var/log/panoptesd/audit
 
-# 6. Instalar el unit de systemd
+# 6. (Opcional) Configurar Telegram — ver seccion "Notificaciones por
+#    Telegram" mas abajo para como obtener el token y el chat_id.
+sudo touch /etc/panoptesd/telegram.env
+sudo chmod 600 /etc/panoptesd/telegram.env
+sudo nano /etc/panoptesd/telegram.env
+# contenido:
+#   TELEGRAM_BOT_TOKEN=123456:ABC-...
+#   TELEGRAM_CHAT_ID=987654321
+# y en /etc/panoptesd/config.toml, dentro de [telegram]: enabled = true
+
+# 7. Instalar el unit de systemd
 sudo cp systemd/panoptesd.service /etc/systemd/system/
 sudo systemctl daemon-reload
 sudo systemctl enable --now panoptesd.service
@@ -138,6 +155,45 @@ polling, umbrales de CPU/memoria, whitelist de procesos root, regla de
 procesos efimeros, correlacion de red opcional (cara en CPU: recorre los
 file descriptors de todos los procesos, por eso esta deshabilitada por
 defecto y corre cada N ciclos cuando se habilita).
+
+## Notificaciones por Telegram
+
+Opcional (`telegram.enabled = false` por defecto). Cubre tres tipos de
+mensaje, cada uno con un encabezado distinto para distinguirlos de un
+vistazo en el chat:
+
+| Mensaje | Encabezado | Cuando se envia |
+|---|---|---|
+| Alerta de anomalia | 🚨 *Anomalia detectada* | Al momento de cada anomalia real (CPU, memoria, root fuera de whitelist, red, proceso efimero), respetando el mismo `cooldown_secs` que ya limita el disparo del script de auditoria. Incluye timestamp, PID, nombre de proceso, usuario, tipo de anomalia y la metrica/detalle que la disparo. |
+| Status periodico | 📊 *Status de panoptesd* | Cada `status_interval_hours` (12h por defecto). Uptime del servidor, %CPU y memoria (total/disponible), uso de disco por particion, cantidad de procesos vigilados, anomalias reales en las ultimas 12h, y version/uptime/ultima anomalia del propio daemon. |
+| Resumen semanal | 🗂️ *Resumen semanal de auditoria* | En `weekly_summary_day`/`weekly_summary_hour` (domingo 23:00 UTC por defecto). Dispara ademas una auditoria de rutina programada y consolida todas las auditorias de la semana (por anomalia real o de rutina): cuantas corrieron, motivo de cada una y si el script de auditoria termino bien (✅) o con error (⚠️). Si no hubo ninguna anomalia real esa semana, el mensaje lo indica igual, sin necesidad de revisar logs. |
+
+### Configurar el bot
+
+1. Crear un bot con [@BotFather](https://t.me/BotFather) (`/newbot`) y
+   guardar el token que te da (formato `123456:ABC-...`).
+2. Obtener el `chat_id` donde queres recibir las notificaciones: escribile
+   algo al bot (o agregalo a un grupo) y despues abri
+   `https://api.telegram.org/bot<TOKEN>/getUpdates` en el navegador — el
+   `chat_id` aparece en la respuesta JSON (`message.chat.id`).
+3. Guardar ambos valores en `/etc/panoptesd/telegram.env` (permisos `600`,
+   solo root), **nunca** en `config.toml` ni en el repo:
+   ```
+   TELEGRAM_BOT_TOKEN=123456:ABC-...
+   TELEGRAM_CHAT_ID=987654321
+   ```
+4. En `/etc/panoptesd/config.toml`, dentro de `[telegram]`, poner
+   `enabled = true` y ajustar `status_interval_hours`,
+   `weekly_summary_day`/`weekly_summary_hour` y `disk_paths` segun
+   necesites (ver `config/config.example.toml`).
+5. `sudo systemctl restart panoptesd.service`. Si el token/chat_id faltan
+   o son invalidos, el daemon arranca igual: se loguea un error y Telegram
+   queda deshabilitado para esa corrida (nunca es motivo de caida).
+
+El envio HTTP a la API de Telegram (via `ureq`, sincrono) corre solo en los
+hilos de los workers de auditoria y en los dos hilos de los schedulers —
+nunca en el loop principal de polling de `/proc`, asi que un timeout o una
+caida de red hacia Telegram no afecta la deteccion de anomalias.
 
 ## Shutdown limpio
 

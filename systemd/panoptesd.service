@@ -7,6 +7,12 @@ Documentation=https://example.internal/panoptesd
 Type=simple
 ExecStart=/opt/panoptesd/panoptesd --config /etc/panoptesd/config.toml
 
+# TELEGRAM_BOT_TOKEN y TELEGRAM_CHAT_ID viven aca, nunca en el repo ni en
+# config.toml. El "-" inicial hace que el archivo sea opcional: si no
+# existe (o telegram.enabled=false en config.toml), el daemon arranca
+# igual sin Telegram.
+EnvironmentFile=-/etc/panoptesd/telegram.env
+
 # Necesita leer /proc de todos los procesos (incluyendo de otros usuarios)
 # y ejecutar el script de auditoria con privilegios para inspeccionar
 # cualquier proceso del sistema.

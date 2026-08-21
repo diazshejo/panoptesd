@@ -1,21 +1,29 @@
 mod config;
+mod history;
+mod hoststats;
 mod logging;
 mod network;
 mod process;
 mod rules;
+mod scheduler;
 mod signals;
+mod telegram;
+mod timefmt;
 mod trigger;
 mod userdb;
 
 use config::Config;
+use history::AuditHistory;
 use process::ProcessState;
 use rules::AnomalyKind;
 use std::collections::hash_map::Entry;
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::SyncSender;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
+use telegram::TelegramClient;
 use trigger::{CooldownTracker, TriggerJob};
 use userdb::UserDb;
 
@@ -37,9 +45,31 @@ fn parse_config_path() -> PathBuf {
     PathBuf::from("/etc/panoptesd/config.toml")
 }
 
+/// Arma el cliente de Telegram si `telegram.enabled = true` en la config.
+/// El token y el chat_id salen de variables de entorno (nunca del TOML).
+/// Si faltan o estan vacias, se loguea el error y Telegram queda
+/// deshabilitado para toda la corrida: nunca es motivo para no arrancar.
+fn build_telegram_client(config: &Config) -> Option<Arc<TelegramClient>> {
+    if !config.telegram.enabled {
+        return None;
+    }
+    let token = std::env::var("TELEGRAM_BOT_TOKEN").unwrap_or_default();
+    let chat_id = std::env::var("TELEGRAM_CHAT_ID").unwrap_or_default();
+    if token.is_empty() || chat_id.is_empty() {
+        tracing::error!(
+            "telegram.enabled=true pero TELEGRAM_BOT_TOKEN/TELEGRAM_CHAT_ID no estan \
+             seteados (o vacios); Telegram queda deshabilitado para esta corrida"
+        );
+        return None;
+    }
+    let timeout = Duration::from_secs(config.telegram.request_timeout_secs);
+    Some(Arc::new(TelegramClient::new(token, chat_id, timeout)))
+}
+
 fn main() -> anyhow::Result<()> {
+    let daemon_start = Instant::now();
     let config_path = parse_config_path();
-    let config = Config::load(&config_path)?;
+    let config = Arc::new(Config::load(&config_path)?);
 
     let _log_guards = logging::init(&config);
     tracing::info!(config = ?config_path, "panoptesd iniciando");
@@ -52,15 +82,44 @@ fn main() -> anyhow::Result<()> {
     }
 
     let shutdown = signals::setup_shutdown_flag();
+    let history = Arc::new(AuditHistory::new());
+    let watched_count = Arc::new(AtomicUsize::new(0));
+    let telegram_client = build_telegram_client(&config);
+
     let (tx, worker_handles) = trigger::spawn_worker_pool(
         config.audit_script_path.clone(),
         config.script_worker_threads,
+        telegram_client.clone(),
+        Arc::clone(&history),
     );
 
-    run_loop(&config, &shutdown, &tx);
+    let mut scheduler_handles = Vec::new();
+    if let Some(client) = &telegram_client {
+        tracing::info!("integracion con Telegram habilitada: status periodico y resumen semanal activos");
+        scheduler_handles.push(scheduler::spawn_status_scheduler(
+            Arc::clone(&config),
+            Arc::clone(&shutdown),
+            Arc::clone(client),
+            Arc::clone(&history),
+            Arc::clone(&watched_count),
+            daemon_start,
+        ));
+        scheduler_handles.push(scheduler::spawn_weekly_scheduler(
+            Arc::clone(&config),
+            Arc::clone(&shutdown),
+            Arc::clone(client),
+            Arc::clone(&history),
+            tx.clone(),
+        ));
+    }
+
+    run_loop(&config, &shutdown, &tx, &watched_count);
 
     tracing::info!("señal de apagado recibida, cerrando cola de auditoria y esperando workers");
     drop(tx);
+    for handle in scheduler_handles {
+        let _ = handle.join();
+    }
     for handle in worker_handles {
         let _ = handle.join();
     }
@@ -68,7 +127,12 @@ fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
-fn run_loop(config: &Config, shutdown: &std::sync::atomic::AtomicBool, tx: &SyncSender<TriggerJob>) {
+fn run_loop(
+    config: &Config,
+    shutdown: &std::sync::atomic::AtomicBool,
+    tx: &SyncSender<TriggerJob>,
+    watched_count: &AtomicUsize,
+) {
     let ticks_per_sec = process::clock_ticks_per_sec();
     let page_size = process::page_size();
     let poll_interval = Duration::from_secs(config.poll_interval_secs);
@@ -146,6 +210,8 @@ fn run_loop(config: &Config, shutdown: &std::sync::atomic::AtomicBool, tx: &Sync
         if cycle.is_multiple_of(COOLDOWN_SWEEP_EVERY_CYCLES) {
             cooldowns.sweep(Instant::now());
         }
+
+        watched_count.store(states.len(), Ordering::Relaxed);
 
         let elapsed = tick_start.elapsed();
         let remaining = poll_interval.saturating_sub(elapsed);
