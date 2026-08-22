@@ -5,6 +5,7 @@
 
 use crate::config::Config;
 use crate::process::ProcessState;
+use std::fs;
 use std::time::Instant;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -53,7 +54,7 @@ pub struct AnomalyEvent {
 /// actualizado en el tick actual. Las reglas de proceso efimero y red se
 /// evaluan aparte (necesitan contexto adicional: desaparicion de PID y
 /// tabla de conexiones, respectivamente).
-pub fn evaluate(config: &Config, state: &mut ProcessState, now: Instant) -> Vec<AnomalyEvent> {
+pub fn evaluate(config: &Config, pid: i32, state: &mut ProcessState, now: Instant) -> Vec<AnomalyEvent> {
     let mut events = Vec::new();
 
     let cpu_cfg = &config.rules.cpu;
@@ -91,7 +92,7 @@ pub fn evaluate(config: &Config, state: &mut ProcessState, now: Instant) -> Vec<
     }
 
     let root_cfg = &config.rules.root_whitelist;
-    if root_cfg.enabled && state.uid == 0 {
+    if root_cfg.enabled && state.uid == 0 && !is_kernel_thread(pid, state.ppid) {
         let allowed = root_cfg
             .allowed_names
             .iter()
@@ -105,6 +106,38 @@ pub fn evaluate(config: &Config, state: &mut ProcessState, now: Instant) -> Vec<
     }
 
     events
+}
+
+/// True si `pid` es un kernel thread (no un proceso de usuario real
+/// corriendo como root): o es hijo directo de `kthreadd` (PPID 2), o no
+/// tiene un binario real detras (`/proc/<pid>/exe` no resuelve). Los
+/// kernel threads tienen nombres dinamicos (`kworker/*`, `irq/*`,
+/// `card1-crtc*`, etc.) que no se pueden whitelistear uno por uno, asi que
+/// se excluyen de `root_not_whitelisted` antes de mirar el nombre.
+///
+/// El chequeo de PPID no cuesta una lectura extra (ya viene del mismo
+/// parseo de `/proc/<pid>/stat` que da uid/cpu/rss); el de `exe` si la
+/// necesita, pero con corto circuito: solo se llama si el PPID no fue
+/// suficiente para descartarlo, y solo se invoca para procesos root (este
+/// chequeo vive detras de `state.uid == 0` en `evaluate`).
+fn is_kernel_thread(pid: i32, ppid: i32) -> bool {
+    const KTHREADD_PID: i32 = 2;
+    if ppid == KTHREADD_PID {
+        return true;
+    }
+    !has_real_exe(pid)
+}
+
+/// True si `/proc/<pid>/exe` resuelve a un binario real. Los kernel
+/// threads no tienen ejecutable de usuario detras: el symlink no existe o
+/// falla con ENOENT/EACCES segun el kernel. Un target que contenga
+/// "(deleted)" (binario borrado del disco despues de ejecutarse) tampoco
+/// cuenta como un binario real vigente.
+fn has_real_exe(pid: i32) -> bool {
+    match fs::read_link(format!("/proc/{pid}/exe")) {
+        Ok(target) => !target.to_string_lossy().contains("(deleted)"),
+        Err(_) => false,
+    }
 }
 
 /// Evalua la regla de proceso efimero cuando un PID que estaba siendo

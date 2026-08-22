@@ -188,7 +188,7 @@ fn run_loop(
                 }
             };
 
-            let events = rules::evaluate(config, state, now);
+            let events = rules::evaluate(config, pid, state, now);
             for event in events {
                 dispatch(tx, &mut cooldowns, pid, state, event, now);
             }

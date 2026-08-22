@@ -37,6 +37,7 @@ pub fn page_size() -> u64 {
 pub struct ProcSample {
     pub comm: String,
     pub uid: u32,
+    pub ppid: i32,
     pub utime: u64,
     pub stime: u64,
     pub rss_bytes: u64,
@@ -71,9 +72,11 @@ pub fn read_process(pid: i32, page_size: u64, buf: &mut String) -> Option<ProcSa
         *slot = it.next().unwrap_or("");
     }
 
+    // ppid  = campo 4  -> indice post-comm 1
     // utime = campo 14 -> indice post-comm 11
     // stime = campo 15 -> indice post-comm 12
     // rss   = campo 24 -> indice post-comm 21
+    let ppid: i32 = fields[1].parse().ok()?;
     let utime: u64 = fields[11].parse().ok()?;
     let stime: u64 = fields[12].parse().ok()?;
     let rss_pages: u64 = fields[21].parse().ok()?;
@@ -85,6 +88,7 @@ pub fn read_process(pid: i32, page_size: u64, buf: &mut String) -> Option<ProcSa
     Some(ProcSample {
         comm,
         uid,
+        ppid,
         utime,
         stime,
         rss_bytes: rss_pages * page_size,
@@ -116,6 +120,7 @@ pub fn list_pids(buf: &mut Vec<i32>) {
 pub struct ProcessState {
     pub comm: String,
     pub uid: u32,
+    pub ppid: i32,
     pub username: String,
     pub last_utime: u64,
     pub last_stime: u64,
@@ -132,6 +137,7 @@ impl ProcessState {
         ProcessState {
             comm: sample.comm.clone(),
             uid: sample.uid,
+            ppid: sample.ppid,
             username,
             last_utime: sample.utime,
             last_stime: sample.stime,
@@ -160,6 +166,7 @@ impl ProcessState {
             self.comm = sample.comm.clone();
         }
         self.uid = sample.uid;
+        self.ppid = sample.ppid;
         self.last_utime = sample.utime;
         self.last_stime = sample.stime;
         self.last_sample_at = now;
