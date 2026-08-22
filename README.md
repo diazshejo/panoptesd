@@ -154,7 +154,29 @@ Ver `config/config.example.toml`, comentado campo por campo: intervalo de
 polling, umbrales de CPU/memoria, whitelist de procesos root, regla de
 procesos efimeros, correlacion de red opcional (cara en CPU: recorre los
 file descriptors de todos los procesos, por eso esta deshabilitada por
-defecto y corre cada N ciclos cuando se habilita).
+defecto y corre cada `check_every_n_cycles` ciclos cuando se habilita).
+
+### Reglas de red (`[network]`, opcional)
+
+Dos reglas independientes, ambas gateadas por el mismo
+`check_every_n_cycles` (no corren en cada tick):
+
+- **`nuevo_puerto_listen`**: lee `/proc/net/{tcp,udp}{,6}` buscando sockets
+  en LISTEN (TCP) o bindeados sin conectar (UDP, el equivalente practico a
+  "escuchando"), cruza el inodo con `/proc/<pid>/fd/*` para identificar el
+  proceso dueño, y compara contra el snapshot del ciclo anterior. Un
+  puerto que no estaba antes y no figura en `allowed_listen_ports` dispara
+  la alerta, con protocolo, IP local (distingue `0.0.0.0` de una IP
+  especifica) y puerto. El primer chequeo desde que arranca el daemon solo
+  releva la linea de base sin alertar, para no reportar como "nuevos" los
+  puertos que ya estaban escuchando al iniciar.
+- **`conexion_saliente_no_esperada`**: de las conexiones TCP ESTABLISHED
+  (solo IPv4), la IP remota se valida contra `allowed_cidrs_v4` y el
+  puerto remoto contra `allowed_remote_ports`; si no matchea ninguno de
+  los dos, dispara la alerta.
+
+Ambas reparten el mismo mapeo inodo->pid (el paso costoso) y usan el mismo
+`cooldown_secs` por (pid, tipo) que el resto de las reglas.
 
 ## Notificaciones por Telegram
 
@@ -205,10 +227,12 @@ via systemd ya queda cubierto.
 
 ## Limitaciones conocidas
 
-- La correlacion de red (`network.enabled`) solo cubre IPv4 (`/proc/net/tcp`,
-  no `tcp6`) y es deliberadamente costosa (recorre `/proc/<pid>/fd` de todos
-  los procesos); usala con un `check_every_n_cycles` alto en servidores con
-  muchos procesos/conexiones.
+- La correlacion de red (`network.enabled`) es deliberadamente costosa
+  (recorre `/proc/<pid>/fd` de todos los procesos); usala con un
+  `check_every_n_cycles` alto en servidores con muchos procesos/conexiones.
+  `nuevo_puerto_listen` cubre tcp/tcp6/udp/udp6; `conexion_saliente_no_esperada`
+  (conexiones ESTABLISHED) sigue siendo solo IPv4, igual que
+  `allowed_cidrs_v4`.
 - El nombre de proceso (`comm`) que usa la whitelist de root viene de
   `/proc/<pid>/stat` y esta truncado a 15 caracteres por el kernel; si dos
   binarios distintos comparten un nombre truncado, la whitelist no los

@@ -63,15 +63,26 @@ max_lifetime_secs = 2
 
 [network]
 # La correlacion de sockets recorre los fds de todos los procesos: es la
-# regla mas costosa. Se deja deshabilitada por defecto.
+# regla mas costosa. Se deja deshabilitada por defecto. Habilita dos
+# reglas independientes (ver README, seccion "Reglas de red"):
+# nuevo_puerto_listen y conexion_saliente_no_esperada.
 enabled = false
 # Cada cuantos ciclos de polling se hace la correlacion (si esta habilitada).
 check_every_n_cycles = 6
+
+# --- conexion_saliente_no_esperada (TCP ESTABLISHED, solo IPv4) ---
 # Puertos remotos considerados normales (a cualquier IP).
 allowed_remote_ports = [80, 443, 53, 123]
 # Rangos IPv4 esperados (notacion CIDR). Conexiones fuera de estos rangos
 # y de allowed_remote_ports se consideran anomalas.
 allowed_cidrs_v4 = ["10.0.0.0/8", "192.168.0.0/16", "127.0.0.0/8"]
+
+# --- nuevo_puerto_listen (tcp/tcp6/udp/udp6) ---
+# Puertos locales en los que se espera que algo quede escuchando (ej el
+# puerto de sshd o el de un servicio propio). Ajustar segun el servidor
+# antes de habilitar: cualquier puerto no listado que aparezca en LISTEN
+# despues del primer chequeo dispara la alerta.
+allowed_listen_ports = [22]
 
 [telegram]
 # Habilita las tres notificaciones por Telegram: alerta inmediata de

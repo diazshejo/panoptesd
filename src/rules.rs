@@ -13,7 +13,8 @@ pub enum AnomalyKind {
     MemoryOutOfRange,
     RootNotWhitelisted,
     EphemeralProcess,
-    UnexpectedNetwork,
+    NewListenPort,
+    UnexpectedOutboundConnection,
     /// No es una anomalia real: la auditoria de rutina que dispara el
     /// scheduler semanal de Telegram. Comparte el mismo tipo para poder
     /// viajar por el mismo `TriggerJob`/pool de workers/historial que las
@@ -29,7 +30,8 @@ impl AnomalyKind {
             AnomalyKind::MemoryOutOfRange => "memory_out_of_range",
             AnomalyKind::RootNotWhitelisted => "root_not_whitelisted",
             AnomalyKind::EphemeralProcess => "ephemeral_process",
-            AnomalyKind::UnexpectedNetwork => "unexpected_network",
+            AnomalyKind::NewListenPort => "nuevo_puerto_listen",
+            AnomalyKind::UnexpectedOutboundConnection => "conexion_saliente_no_esperada",
             AnomalyKind::ScheduledAudit => "scheduled_weekly_audit",
         }
     }

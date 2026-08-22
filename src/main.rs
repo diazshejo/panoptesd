@@ -141,6 +141,10 @@ fn run_loop(
     let mut states: HashMap<i32, ProcessState> = HashMap::new();
     let mut cooldowns = CooldownTracker::new(cooldown);
     let mut userdb = UserDb::load();
+    // Linea de base de puertos LISTEN: None hasta el primer chequeo de red
+    // (asi el primer ciclo solo releva lo que ya estaba escuchando al
+    // arrancar, sin alertar por eso).
+    let mut listen_baseline: Option<HashSet<(i32, u16, network::Protocol)>> = None;
 
     // Buffers reutilizados entre ciclos para no reallocar en cada tick.
     let mut pid_buf: Vec<i32> = Vec::with_capacity(512);
@@ -204,7 +208,7 @@ fn run_loop(
         });
 
         if config.network.enabled && cycle.is_multiple_of(config.network.check_every_n_cycles) {
-            check_network(config, &states, &pid_buf, tx, &mut cooldowns);
+            check_network(config, &states, &pid_buf, tx, &mut cooldowns, &mut listen_baseline);
         }
 
         if cycle.is_multiple_of(COOLDOWN_SWEEP_EVERY_CYCLES) {
@@ -242,10 +246,31 @@ fn dispatch(
     }
 }
 
+/// Orquesta las dos reglas de red, ambas gateadas por el mismo
+/// `network.check_every_n_cycles` desde `run_loop`. El mapeo inodo->pid se
+/// arma una sola vez y se comparte entre las dos: es el paso costoso
+/// (recorre /proc/<pid>/fd de todos los procesos).
 fn check_network(
     config: &Config,
     states: &HashMap<i32, ProcessState>,
     pids: &[i32],
+    tx: &SyncSender<TriggerJob>,
+    cooldowns: &mut CooldownTracker,
+    listen_baseline: &mut Option<HashSet<(i32, u16, network::Protocol)>>,
+) {
+    let inode_to_pid = network::build_inode_to_pid(pids);
+    check_unexpected_outbound(config, states, &inode_to_pid, tx, cooldowns);
+    check_new_listen_ports(config, states, &inode_to_pid, tx, cooldowns, listen_baseline);
+}
+
+/// Regla `conexion_saliente_no_esperada`: conexiones TCP ESTABLISHED cuya
+/// IP remota no cae en ningun CIDR permitido (ni su puerto esta en la
+/// whitelist de puertos remotos). Solo IPv4, igual que la whitelist de
+/// CIDRs de la config.
+fn check_unexpected_outbound(
+    config: &Config,
+    states: &HashMap<i32, ProcessState>,
+    inode_to_pid: &HashMap<u64, i32>,
     tx: &SyncSender<TriggerJob>,
     cooldowns: &mut CooldownTracker,
 ) {
@@ -253,7 +278,6 @@ fn check_network(
     if connections.is_empty() {
         return;
     }
-    let inode_to_pid = network::build_inode_to_pid(pids);
 
     for conn in &connections {
         if network::is_allowed(conn, &config.network.allowed_remote_ports, &config.network.allowed_cidrs_v4) {
@@ -269,9 +293,67 @@ fn check_network(
         };
         let now = Instant::now();
         let event = rules::AnomalyEvent {
-            kind: AnomalyKind::UnexpectedNetwork,
-            detail: format!("conexion inesperada a {}:{}", conn.remote_ip, conn.remote_port),
+            kind: AnomalyKind::UnexpectedOutboundConnection,
+            detail: format!("conexion saliente a {}:{} fuera de los CIDRs permitidos", conn.remote_ip, conn.remote_port),
         };
         dispatch(tx, cooldowns, pid, state, event, now);
     }
+}
+
+/// Regla `nuevo_puerto_listen`: compara los sockets en LISTEN/bindeados
+/// (tcp/tcp6/udp/udp6) de este ciclo contra el snapshot del ciclo
+/// anterior. El primer chequeo desde que arranca el daemon (baseline =
+/// None) solo releva lo que ya estaba escuchando, sin alertar: si
+/// alertara ahi, cualquier servicio ya corriendo al arrancar (sshd, etc.)
+/// se reportaria como "nuevo".
+fn check_new_listen_ports(
+    config: &Config,
+    states: &HashMap<i32, ProcessState>,
+    inode_to_pid: &HashMap<u64, i32>,
+    tx: &SyncSender<TriggerJob>,
+    cooldowns: &mut CooldownTracker,
+    baseline: &mut Option<HashSet<(i32, u16, network::Protocol)>>,
+) {
+    let mut sockets = network::parse_listen_tcp("/proc/net/tcp", false);
+    sockets.extend(network::parse_listen_tcp("/proc/net/tcp6", true));
+    sockets.extend(network::parse_listen_udp("/proc/net/udp", false));
+    sockets.extend(network::parse_listen_udp("/proc/net/udp6", true));
+
+    let mut current: HashMap<(i32, u16, network::Protocol), &network::ListenSocket> = HashMap::new();
+    for sock in &sockets {
+        if let Some(&pid) = inode_to_pid.get(&sock.inode) {
+            current.insert((pid, sock.local_port, sock.protocol), sock);
+        }
+    }
+    let current_keys: HashSet<(i32, u16, network::Protocol)> = current.keys().copied().collect();
+
+    let previous = match baseline.take() {
+        Some(prev) => prev,
+        None => {
+            *baseline = Some(current_keys);
+            return;
+        }
+    };
+
+    for &(pid, port, protocol) in current_keys.difference(&previous) {
+        if config.network.allowed_listen_ports.contains(&port) {
+            continue;
+        }
+        let state = match states.get(&pid) {
+            Some(s) => s,
+            None => continue,
+        };
+        let sock = match current.get(&(pid, port, protocol)) {
+            Some(s) => s,
+            None => continue,
+        };
+        let now = Instant::now();
+        let event = rules::AnomalyEvent {
+            kind: AnomalyKind::NewListenPort,
+            detail: format!("{} escuchando en {}:{} (nuevo)", protocol.as_str(), sock.local_ip, port),
+        };
+        dispatch(tx, cooldowns, pid, state, event, now);
+    }
+
+    *baseline = Some(current_keys);
 }

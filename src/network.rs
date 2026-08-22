@@ -1,17 +1,43 @@
 //! Correlacion opcional de conexiones de red con procesos, leyendo
-//! /proc/net/tcp{,6} y /proc/<pid>/fd/* a mano (sin libs de sockets).
+//! /proc/net/{tcp,udp}{,6} y /proc/<pid>/fd/* a mano (sin libs de sockets).
+//! Dos reglas independientes usan estas primitivas (ver `main.rs`):
+//! puertos LISTEN nuevos (tcp/tcp6/udp/udp6) y conexiones salientes
+//! establecidas fuera de los CIDRs esperados (solo IPv4 por ahora, igual
+//! que la whitelist de CIDRs de la config).
 //!
-//! Es la regla mas costosa (recorre los fds de todos los procesos), por
-//! eso el loop principal solo la ejecuta cada `check_every_n_cycles` y
+//! Es la correlacion mas costosa (recorre los fds de todos los procesos),
+//! por eso el loop principal solo la ejecuta cada `check_every_n_cycles` y
 //! unicamente si `network.enabled = true` en la configuracion.
 
 use std::collections::HashMap;
 use std::fs;
-use std::net::Ipv4Addr;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
 pub struct Connection {
     pub remote_ip: Ipv4Addr,
     pub remote_port: u16,
+    pub inode: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Protocol {
+    Tcp,
+    Udp,
+}
+
+impl Protocol {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Protocol::Tcp => "tcp",
+            Protocol::Udp => "udp",
+        }
+    }
+}
+
+pub struct ListenSocket {
+    pub local_ip: IpAddr,
+    pub local_port: u16,
+    pub protocol: Protocol,
     pub inode: u64,
 }
 
@@ -61,6 +87,75 @@ fn parse_hex_ipv4_port(s: &str) -> Option<(Ipv4Addr, u16)> {
     let ip = Ipv4Addr::new(bytes[0], bytes[1], bytes[2], bytes[3]);
     let port = u16::from_str_radix(port_hex, 16).ok()?;
     Some((ip, port))
+}
+
+/// Igual que `parse_hex_ipv4_port` pero para /proc/net/{tcp,udp}6: la
+/// direccion son 32 hex chars = 4 palabras de 32 bits (s6_addr32[0..4]),
+/// cada una con el mismo problema de orden de bytes que el caso v4 (hay
+/// que revertir cada palabra de 4 bytes por separado, no el bloque
+/// completo).
+fn parse_hex_ipv6_port(s: &str) -> Option<(Ipv6Addr, u16)> {
+    let (addr_hex, port_hex) = s.split_once(':')?;
+    if addr_hex.len() != 32 {
+        return None;
+    }
+    let mut bytes = [0u8; 16];
+    for i in 0..4 {
+        let word = u32::from_str_radix(&addr_hex[i * 8..i * 8 + 8], 16).ok()?;
+        bytes[i * 4..i * 4 + 4].copy_from_slice(&word.to_le_bytes());
+    }
+    let port = u16::from_str_radix(port_hex, 16).ok()?;
+    Some((Ipv6Addr::from(bytes), port))
+}
+
+/// Parsea sockets en estado de "escucha" de un archivo /proc/net/{tcp,udp}{,6}.
+/// Para TCP eso es el estado LISTEN (0A hex); UDP no tiene un estado de
+/// escucha real (es sin conexion), asi que se usa la misma convencion que
+/// `ss -l`: estado 07 (UNCONN) = socket bindeado a un puerto local
+/// esperando datagramas, el equivalente practico a "escuchando".
+fn parse_listen_sockets(path: &str, protocol: Protocol, listen_state: &str, is_v6: bool) -> Vec<ListenSocket> {
+    let content = match fs::read_to_string(path) {
+        Ok(c) => c,
+        Err(_) => return Vec::new(),
+    };
+    let mut out = Vec::new();
+    for line in content.lines().skip(1) {
+        let fields: Vec<&str> = line.split_whitespace().collect();
+        if fields.len() < 10 {
+            continue;
+        }
+        if fields[3] != listen_state {
+            continue;
+        }
+        let parsed = if is_v6 {
+            parse_hex_ipv6_port(fields[1]).map(|(ip, port)| (IpAddr::V6(ip), port))
+        } else {
+            parse_hex_ipv4_port(fields[1]).map(|(ip, port)| (IpAddr::V4(ip), port))
+        };
+        let (local_ip, local_port) = match parsed {
+            Some(v) => v,
+            None => continue,
+        };
+        let inode = match fields[9].parse::<u64>() {
+            Ok(i) => i,
+            Err(_) => continue,
+        };
+        out.push(ListenSocket {
+            local_ip,
+            local_port,
+            protocol,
+            inode,
+        });
+    }
+    out
+}
+
+pub fn parse_listen_tcp(path: &str, is_v6: bool) -> Vec<ListenSocket> {
+    parse_listen_sockets(path, Protocol::Tcp, "0A", is_v6)
+}
+
+pub fn parse_listen_udp(path: &str, is_v6: bool) -> Vec<ListenSocket> {
+    parse_listen_sockets(path, Protocol::Udp, "07", is_v6)
 }
 
 /// Construye un mapa inode de socket -> pid recorriendo /proc/<pid>/fd de

@@ -98,12 +98,20 @@ pub struct NetworkConfig {
     /// (costosa: recorre /proc/<pid>/fd de todos los procesos).
     #[serde(default = "default_network_every")]
     pub check_every_n_cycles: u64,
-    /// Puertos remotos considerados esperados/normales.
+    /// Puertos remotos considerados esperados/normales para la regla de
+    /// conexiones salientes (`conexion_saliente_no_esperada`).
     #[serde(default)]
     pub allowed_remote_ports: Vec<u16>,
-    /// Rangos IPv4 esperados en notacion CIDR (ej "10.0.0.0/8").
+    /// Rangos IPv4 esperados en notacion CIDR (ej "10.0.0.0/8") para la
+    /// misma regla de conexiones salientes.
     #[serde(default)]
     pub allowed_cidrs_v4: Vec<String>,
+    /// Puertos locales en los que se espera que algo quede en LISTEN
+    /// (tcp/tcp6) o bindeado (udp/udp6) — ej el puerto de sshd o el de un
+    /// servicio propio. Un puerto nuevo que no este en esta lista dispara
+    /// `nuevo_puerto_listen`.
+    #[serde(default)]
+    pub allowed_listen_ports: Vec<u16>,
 }
 
 impl Default for NetworkConfig {
@@ -113,6 +121,7 @@ impl Default for NetworkConfig {
             check_every_n_cycles: default_network_every(),
             allowed_remote_ports: Vec::new(),
             allowed_cidrs_v4: Vec::new(),
+            allowed_listen_ports: Vec::new(),
         }
     }
 }
