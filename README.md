@@ -3,11 +3,26 @@
 Daemon de monitoreo de procesos para Linux, escrito en Rust, orientado a bajo
 consumo de CPU/memoria. Corre en polling (sin `tokio`, sin async), lee
 `/proc` a mano, y dispara un script bash de auditoria configurable cuando
-detecta comportamiento anomalo (CPU sostenida, memoria fuera de rango,
-procesos root fuera de whitelist, conexiones de red inesperadas, o procesos
-efimeros tipo cryptominer). Opcionalmente notifica todo por Telegram: alerta
-inmediata por anomalia, status del servidor cada 12h, y resumen semanal de
-auditoria.
+detecta comportamiento anomalo. Opcionalmente notifica todo por Telegram:
+alerta inmediata por anomalia, status del servidor cada 12h, y resumen
+semanal de auditoria.
+
+## Que detecta hoy (alcance actual)
+
+| Regla | Tipo (`AnomalyKind`) | Donde se configura |
+|---|---|---|
+| CPU sostenida por encima de un umbral | `cpu_sustained` | `[rules.cpu]` |
+| RSS de un proceso fuera de rango | `memory_out_of_range` | `[rules.memory]` |
+| Proceso corriendo como root fuera de whitelist (excluye kernel threads, ver mas abajo) | `root_not_whitelisted` | `[rules.root_whitelist]` |
+| Proceso que vive menos de N segundos (cryptominer/malware efimero) | `ephemeral_process` | `[rules.ephemeral]` |
+| Puerto nuevo en LISTEN/bindeado (tcp/tcp6/udp/udp6) | `nuevo_puerto_listen` | `[network]`, deshabilitado por defecto |
+| Conexion TCP saliente ESTABLISHED fuera de los CIDRs/puertos esperados (solo IPv4) | `conexion_saliente_no_esperada` | `[network]`, deshabilitado por defecto |
+
+Todas comparten el mismo `cooldown_secs` por (pid, tipo) y el mismo pool de
+workers que ejecuta `audit_script_path`. Las notificaciones de Telegram
+(`[telegram]`) son ortogonales a todo esto: si estan habilitadas, cualquiera
+de las anomalias de arriba dispara ademas un mensaje 🚨, sin cambiar la
+logica de deteccion.
 
 ## Estructura del proyecto
 
@@ -156,6 +171,34 @@ procesos efimeros, correlacion de red opcional (cara en CPU: recorre los
 file descriptors de todos los procesos, por eso esta deshabilitada por
 defecto y corre cada `check_every_n_cycles` ciclos cuando se habilita).
 
+### Whitelist de root y kernel threads (`[rules.root_whitelist]`)
+
+`allowed_names` es una lista de nombres exactos para **procesos de usuario
+reales** que corren como root (`systemd`, `sshd`, `cron`, `crond`,
+`rsyslogd`, `systemd-journal`, `systemd-udevd`, `systemd-logind`,
+`dbus-daemon`, `NetworkManager`, `panoptesd`). No hace falta agregar
+kernel threads ahi (`kworker/*`, `irq/*`, `ksoftirqd/*`, `migration/*`,
+`kswapd0`, threads de drivers como `card1-crtc*`, etc.): el daemon los
+excluye automaticamente de esta regla antes de mirar el nombre, porque
+tienen nombres dinamicos que no se pueden whitelistear uno por uno. Un
+proceso se clasifica como kernel thread (y se salta `root_not_whitelisted`,
+aunque sigue evaluado por CPU/memoria) si cumple cualquiera de:
+
+1. Es hijo directo de `kthreadd` (`PPID == 2`).
+2. `/proc/<pid>/exe` no resuelve a un binario real (falla, o el symlink
+   esta borrado).
+
+Este filtro fue necesario porque en una prueba real (escritorio con GPU
+AMD) la regla, tal como estaba, disparo ~377 auditorias en 2 minutos
+solo por los kernel threads de video/scheduler del kernel — ver
+`CHANGELOG.md` para el detalle. En un servidor sin
+esa carga de drivers de escritorio el volumen deberia ser mucho menor,
+pero conviene tenerlo presente al calibrar un servidor nuevo: si
+`root_not_whitelisted` dispara mucho al arrancar, revisar primero si son
+procesos de usuario reales faltantes en `allowed_names` (agregarlos) o
+si aun asi hay ruido (reportar, seria un caso no cubierto por el filtro
+de kernel threads).
+
 ### Reglas de red (`[network]`, opcional)
 
 Dos reglas independientes, ambas gateadas por el mismo
@@ -224,6 +267,45 @@ de polling en curso, cierra la cola de auditoria (dejando que los workers
 terminen los scripts ya en ejecucion) y sale. `systemctl stop` y
 `systemctl restart` usan `SIGTERM` por defecto, por lo que el shutdown
 via systemd ya queda cubierto.
+
+## Checklist para pasar a produccion
+
+Lo que probamos hasta ahora fue una instalacion de prueba en un escritorio
+de desarrollo (`devsergi`), no el servidor real. Antes de instalar en el
+servidor de produccion:
+
+1. **Config de reglas**: partir de `config/config.example.toml` (no de la
+   config de prueba usada en `devsergi`, que tenia umbrales relajados a
+   proposito: `poll_interval_secs=2`, `cpu.threshold_percent=5.0`,
+   `cpu.sustained_secs=5`). Los valores de referencia para produccion son
+   los del ejemplo: `poll_interval_secs=5`, `cooldown_secs=300`,
+   `cpu.threshold_percent=85.0` sostenido `60s`, `memory.max_rss_mb=2048`,
+   `ephemeral.max_lifetime_secs=2`.
+2. **`allowed_names` de `root_whitelist`**: revisar que binarios propios de
+   ese servidor corren como root ademas de los 11 ya listados (por
+   ejemplo un reverse proxy, un agente de monitoreo, etc.). Los kernel
+   threads ya se excluyen solos (ver seccion de arriba), no hace falta
+   whitelistearlos.
+3. **`[network]`** (si se va a habilitar): definir `allowed_listen_ports`
+   (puertos que ese servidor realmente expone), `allowed_cidrs_v4` y
+   `allowed_remote_ports` segun su topologia real de red. No habilitarlo
+   "a ciegas" el primer dia: activarlo, mirar `journalctl` un rato con
+   `cooldown_secs` bajo antes de confiar en que el volumen de alertas es
+   razonable — la misma leccion que dejo el incidente de `root_whitelist`
+   aplica a cualquier regla nueva en un host que todavia no conocemos bien.
+4. **Telegram**: crear un bot nuevo (o rotar el token) — el token usado en
+   la prueba de `devsergi` quedo en texto plano en una conversacion y no
+   deberia reusarse en produccion. Cargar `TELEGRAM_BOT_TOKEN`/
+   `TELEGRAM_CHAT_ID` en `/etc/panoptesd/telegram.env` (permisos `600`,
+   nunca en el repo), y `telegram.enabled = true` en `config.toml`. Ver
+   seccion "Notificaciones por Telegram" para el detalle completo.
+5. **Instalar y habilitar** siguiendo "Instalacion como servicio systemd"
+   mas arriba, terminando en `sudo systemctl enable --now panoptesd.service`
+   (`enable`, no solo `start`, para que sobreviva un reinicio del server).
+6. **Verificar** con `systemctl status` + `journalctl -u panoptesd -f`
+   durante un rato antes de darlo por andando, y confirmar que llega al
+   menos un mensaje de Telegram (la alerta o, si no hay anomalias, esperar
+   el primer status a las `status_interval_hours`).
 
 ## Limitaciones conocidas
 
