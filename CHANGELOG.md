@@ -20,6 +20,32 @@ y este proyecto adhiere a [Semantic Versioning](https://semver.org/lang/es/).
   defecto): `nuevo_puerto_listen` (tcp/tcp6/udp/udp6, compara contra el
   snapshot del ciclo anterior) y `conexion_saliente_no_esperada`
   (reemplaza a la anterior `unexpected_network`, TCP ESTABLISHED IPv4).
+- Modo CLI `panoptesd --send-telegram "<mensaje>" [--config <ruta>]`:
+  manda un unico mensaje por Telegram y sale, sin arrancar el loop de
+  monitoreo ni los schedulers. Reutiliza la config completa (`[telegram]`:
+  `enabled`, `request_timeout_secs`) y las credenciales de
+  `TELEGRAM_BOT_TOKEN`/`TELEGRAM_CHAT_ID`, via la misma
+  `telegram_client_from_env()` que usa el daemon. El texto pasa por
+  `escape_markdown()` (nuevo `format_external_message()`), asi un script
+  puede pasar paths o timestamps crudos. Sale con 0 si envio (o si
+  `telegram.enabled = false`, silencioso), 1 si fallo (motivo en stderr),
+  2 ante uso invalido; `--help` imprime el uso. Los argumentos
+  desconocidos ahora son error en vez de ignorarse.
+
+- Monitoreo de logins SSH exitosos (`src/ssh_watch.rs`, seccion
+  `[ssh_watch]`, deshabilitado por defecto), separado del motor de
+  anomalias por polling de `/proc`: lanza `journalctl -f -n 0 -o cat -u
+  <unit_name>` como subproceso y un hilo dedicado lee su stdout linea por
+  linea (bloqueante, sin costo cuando no hay eventos). Cada `Accepted
+  password|publickey for <user> from <ip> port <port>` manda al instante
+  un mensaje 🔑 *Login SSH exitoso* por Telegram (usuario, IP, puerto de
+  origen, metodo, timestamp), sin cooldown y sin pasar por el script de
+  auditoria; usuario e IP pasan por `escape_markdown()`. Si `journalctl`
+  muere se loguea y se relanza a los 5s (backoff hasta 60s si falla en
+  cadena); al apagar el daemon se mata el hijo para desbloquear la
+  lectura. `unit_name` (default `ssh.service`, Debian/Ubuntu) permite
+  usar `sshd.service` (Fedora/RHEL) sin recompilar. Solo logins
+  exitosos: sin intentos fallidos ni otros patrones.
 
 ### Fixed
 
@@ -31,6 +57,28 @@ y este proyecto adhiere a [Semantic Versioning](https://semver.org/lang/es/).
   whitelist si son hijos directos de `kthreadd` (`PPID == 2`) o si
   `/proc/<pid>/exe` no resuelve a un binario real; siguen evaluados por
   CPU/memoria igual que cualquier otro proceso.
+- Los mensajes de Telegram fallaban con 400 `can't parse entities` cuando
+  un campo dinamico contenia un numero impar de `_`/`*` (p.ej. el tipo
+  `conexion_saliente_no_esperada`, 3 guiones bajos): Markdown legacy los
+  tomaba como marcadores de formato sin cerrar. Ahora `escape_markdown()`
+  escapa `_ * \` [` en todos los campos que vienen de datos (tipo de
+  anomalia, proceso, usuario, detalle, path de disco) y nunca en los
+  literales del template; los campos en span de codigo solo neutralizan
+  backticks, porque dentro de un span Telegram no interpreta escapes. El
+  marcador `[✅]` del resumen semanal ya no se pierde como link vacio.
+- `conexion_saliente_no_esperada` trataba las conexiones ENTRANTES como
+  salientes: `/proc/net/tcp` no indica el sentido de un socket
+  ESTABLISHED y la regla solo miraba la IP/puerto remotos, asi que cada
+  login por ssh desde una IP fuera de `allowed_cidrs_v4` (sshd con puerto
+  local 22 y remoto efimero, p.ej. 10773) disparaba una falsa alerta.
+  Ahora `Connection` conserva el puerto local y `network::is_inbound()`
+  descarta antes de evaluar la whitelist toda conexion cuyo puerto local
+  es de servicio: en `allowed_listen_ports`, privilegiado (< 1024), en
+  LISTEN en ese mismo ciclo, o fuera del rango efimero real del kernel
+  (`/proc/sys/net/ipv4/ip_local_port_range`, fallback 32768-60999). Los
+  sockets en escucha se parsean una sola vez por chequeo y se comparten
+  con `nuevo_puerto_listen`. El detalle de la alerta incluye ahora el
+  puerto local.
 
 ## [0.1.0] - 2026-08-21
 

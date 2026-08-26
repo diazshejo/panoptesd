@@ -7,6 +7,7 @@ mod process;
 mod rules;
 mod scheduler;
 mod signals;
+mod ssh_watch;
 mod telegram;
 mod timefmt;
 mod trigger;
@@ -33,43 +34,145 @@ const COOLDOWN_SWEEP_EVERY_CYCLES: u64 = 30;
 /// TTL del cache de /etc/passwd.
 const USERDB_TTL: Duration = Duration::from_secs(300);
 
-fn parse_config_path() -> PathBuf {
-    let mut args = std::env::args().skip(1);
-    while let Some(arg) = args.next() {
-        if arg == "--config" || arg == "-c" {
-            if let Some(path) = args.next() {
-                return PathBuf::from(path);
-            }
-        }
-    }
-    PathBuf::from("/etc/panoptesd/config.toml")
+const DEFAULT_CONFIG_PATH: &str = "/etc/panoptesd/config.toml";
+
+/// Argumentos de linea de comandos. Se parsean a mano: son dos flags, no
+/// justifica sumar `clap` a un daemon que se precia de pocas dependencias.
+struct Cli {
+    config_path: PathBuf,
+    /// `--send-telegram "<mensaje>"`: modo "fire and exit" que manda un
+    /// mensaje por Telegram y termina, sin arrancar el loop de monitoreo
+    /// ni los schedulers. Pensado para cron/scripts externos.
+    send_telegram: Option<String>,
 }
 
-/// Arma el cliente de Telegram si `telegram.enabled = true` en la config.
-/// El token y el chat_id salen de variables de entorno (nunca del TOML).
-/// Si faltan o estan vacias, se loguea el error y Telegram queda
-/// deshabilitado para toda la corrida: nunca es motivo para no arrancar.
-fn build_telegram_client(config: &Config) -> Option<Arc<TelegramClient>> {
+fn usage() -> String {
+    format!(
+        "uso: panoptesd [--config <ruta>] [--send-telegram \"<mensaje>\"]\n\
+         \n\
+         Sin --send-telegram arranca el daemon de monitoreo.\n\
+         Con --send-telegram envia <mensaje> por Telegram (segun [telegram] de la\n\
+         config y TELEGRAM_BOT_TOKEN/TELEGRAM_CHAT_ID del entorno) y sale:\n\
+         0 = enviado (o telegram.enabled=false), 1 = fallo el envio, 2 = uso invalido.\n\
+         \n\
+         --config, -c <ruta>   config TOML (default: {DEFAULT_CONFIG_PATH})"
+    )
+}
+
+/// Devuelve `Err(mensaje)` ante un argumento invalido; el caller lo imprime
+/// a stderr y sale con codigo 2 (convencion de "uso invalido").
+fn parse_cli<I: Iterator<Item = String>>(mut args: I) -> Result<Cli, String> {
+    let mut cli = Cli {
+        config_path: PathBuf::from(DEFAULT_CONFIG_PATH),
+        send_telegram: None,
+    };
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--config" | "-c" => {
+                cli.config_path = PathBuf::from(args.next().ok_or("--config requiere una ruta")?);
+            }
+            "--send-telegram" => {
+                // Un "mensaje" que empieza con `--` es casi seguro el flag
+                // siguiente (`--send-telegram --config x`): mejor cortar
+                // aca que mandar "--config" al chat.
+                let msg = match args.next() {
+                    Some(m) if !m.starts_with("--") => m,
+                    _ => return Err("--send-telegram requiere el mensaje a enviar".to_string()),
+                };
+                if msg.trim().is_empty() {
+                    return Err("--send-telegram: el mensaje no puede estar vacio".to_string());
+                }
+                cli.send_telegram = Some(msg);
+            }
+            "--help" | "-h" => {
+                println!("{}", usage());
+                std::process::exit(0);
+            }
+            other => return Err(format!("argumento desconocido: {other}\n\n{}", usage())),
+        }
+    }
+    Ok(cli)
+}
+
+/// Arma el cliente de Telegram a partir de `telegram.enabled` /
+/// `request_timeout_secs` de la config y de TELEGRAM_BOT_TOKEN /
+/// TELEGRAM_CHAT_ID del entorno (nunca del TOML). Lo comparten el daemon y
+/// el modo `--send-telegram`, asi los dos leen las credenciales igual.
+///
+/// `Ok(None)` = Telegram deshabilitado por config; `Err` = habilitado pero
+/// faltan (o estan vacias) las variables de entorno.
+fn telegram_client_from_env(config: &Config) -> Result<Option<TelegramClient>, String> {
     if !config.telegram.enabled {
-        return None;
+        return Ok(None);
     }
     let token = std::env::var("TELEGRAM_BOT_TOKEN").unwrap_or_default();
     let chat_id = std::env::var("TELEGRAM_CHAT_ID").unwrap_or_default();
     if token.is_empty() || chat_id.is_empty() {
-        tracing::error!(
+        return Err(
             "telegram.enabled=true pero TELEGRAM_BOT_TOKEN/TELEGRAM_CHAT_ID no estan \
-             seteados (o vacios); Telegram queda deshabilitado para esta corrida"
+             seteados (o vacios)"
+                .to_string(),
         );
-        return None;
     }
     let timeout = Duration::from_secs(config.telegram.request_timeout_secs);
-    Some(Arc::new(TelegramClient::new(token, chat_id, timeout)))
+    Ok(Some(TelegramClient::new(token, chat_id, timeout)))
+}
+
+/// Version para el daemon: si faltan credenciales se loguea el error y
+/// Telegram queda deshabilitado para toda la corrida. Nunca es motivo para
+/// no arrancar.
+fn build_telegram_client(config: &Config) -> Option<Arc<TelegramClient>> {
+    match telegram_client_from_env(config) {
+        Ok(client) => client.map(Arc::new),
+        Err(e) => {
+            tracing::error!("{e}; Telegram queda deshabilitado para esta corrida");
+            None
+        }
+    }
+}
+
+/// Modo `--send-telegram`: manda un unico mensaje y devuelve el codigo de
+/// salida del proceso. No inicializa tracing a proposito: esto lo invoca
+/// un cron o un script, y lo que necesita es el error en stderr y un
+/// exit code, no lineas en el log del daemon.
+fn run_send_telegram(config: &Config, message: &str) -> i32 {
+    let client = match telegram_client_from_env(config) {
+        Ok(Some(client)) => client,
+        Ok(None) => return 0, // telegram.enabled=false: no es error, no hay nada que mandar
+        Err(e) => {
+            eprintln!("panoptesd --send-telegram: {e}");
+            return 1;
+        }
+    };
+    // El mensaje viene crudo de afuera (paths, timestamps, etc.): pasa por
+    // el mismo escape que los campos dinamicos de las alertas.
+    let text = telegram::format_external_message(message);
+    match client.send(&text) {
+        Ok(()) => 0,
+        Err(e) => {
+            eprintln!("panoptesd --send-telegram: fallo el envio a Telegram: {e}");
+            1
+        }
+    }
 }
 
 fn main() -> anyhow::Result<()> {
     let daemon_start = Instant::now();
-    let config_path = parse_config_path();
+    let cli = match parse_cli(std::env::args().skip(1)) {
+        Ok(cli) => cli,
+        Err(msg) => {
+            eprintln!("{msg}");
+            std::process::exit(2);
+        }
+    };
+    let config_path = cli.config_path;
     let config = Arc::new(Config::load(&config_path)?);
+
+    // Modo "fire and exit": se resuelve antes de inicializar logging,
+    // señales, workers y schedulers. Nada del daemon arranca.
+    if let Some(message) = cli.send_telegram {
+        std::process::exit(run_send_telegram(&config, &message));
+    }
 
     let _log_guards = logging::init(&config);
     tracing::info!(config = ?config_path, "panoptesd iniciando");
@@ -113,10 +216,22 @@ fn main() -> anyhow::Result<()> {
         ));
     }
 
+    // Hilo propio, independiente del loop de /proc: bloquea leyendo el
+    // journal de sshd y no pasa por reglas ni cooldown.
+    let ssh_watch_handle = if config.ssh_watch.enabled {
+        tracing::info!(unit = %config.ssh_watch.unit_name, "monitoreo de logins SSH habilitado");
+        Some(ssh_watch::spawn(Arc::clone(&config), Arc::clone(&shutdown), telegram_client.clone()))
+    } else {
+        None
+    };
+
     run_loop(&config, &shutdown, &tx, &watched_count);
 
     tracing::info!("señal de apagado recibida, cerrando cola de auditoria y esperando workers");
     drop(tx);
+    if let Some(handle) = ssh_watch_handle {
+        handle.stop_and_join();
+    }
     for handle in scheduler_handles {
         let _ = handle.join();
     }
@@ -259,18 +374,41 @@ fn check_network(
     listen_baseline: &mut Option<HashSet<(i32, u16, network::Protocol)>>,
 ) {
     let inode_to_pid = network::build_inode_to_pid(pids);
-    check_unexpected_outbound(config, states, &inode_to_pid, tx, cooldowns);
-    check_new_listen_ports(config, states, &inode_to_pid, tx, cooldowns, listen_baseline);
+
+    // Los sockets en escucha se leen una sola vez y sirven a las dos reglas:
+    // `nuevo_puerto_listen` los compara contra su baseline y
+    // `conexion_saliente_no_esperada` usa los puertos TCP en LISTEN para
+    // reconocer conexiones entrantes.
+    let mut listen_sockets = network::parse_listen_tcp("/proc/net/tcp", false);
+    listen_sockets.extend(network::parse_listen_tcp("/proc/net/tcp6", true));
+    listen_sockets.extend(network::parse_listen_udp("/proc/net/udp", false));
+    listen_sockets.extend(network::parse_listen_udp("/proc/net/udp6", true));
+    let tcp_listen_ports: HashSet<u16> = listen_sockets
+        .iter()
+        .filter(|s| s.protocol == network::Protocol::Tcp)
+        .map(|s| s.local_port)
+        .collect();
+
+    check_unexpected_outbound(config, states, &inode_to_pid, &tcp_listen_ports, tx, cooldowns);
+    check_new_listen_ports(config, states, &inode_to_pid, &listen_sockets, tx, cooldowns, listen_baseline);
 }
 
-/// Regla `conexion_saliente_no_esperada`: conexiones TCP ESTABLISHED cuya
-/// IP remota no cae en ningun CIDR permitido (ni su puerto esta en la
-/// whitelist de puertos remotos). Solo IPv4, igual que la whitelist de
-/// CIDRs de la config.
+/// Regla `conexion_saliente_no_esperada`: conexiones TCP ESTABLISHED
+/// SALIENTES cuya IP remota no cae en ningun CIDR permitido (ni su puerto
+/// esta en la whitelist de puertos remotos). Solo IPv4, igual que la
+/// whitelist de CIDRs de la config.
+///
+/// /proc/net/tcp no distingue el sentido de un socket ESTABLISHED: una
+/// sesion ssh entrante (local 22, remoto efimero) se ve igual que una
+/// saliente. Sin este filtro cada login por ssh desde una IP fuera de los
+/// CIDRs disparaba una falsa alerta. Las entrantes se descartan aca: si el
+/// puerto local no deberia estar escuchando, es asunto de
+/// `nuevo_puerto_listen`, no de esta regla.
 fn check_unexpected_outbound(
     config: &Config,
     states: &HashMap<i32, ProcessState>,
     inode_to_pid: &HashMap<u64, i32>,
+    tcp_listen_ports: &HashSet<u16>,
     tx: &SyncSender<TriggerJob>,
     cooldowns: &mut CooldownTracker,
 ) {
@@ -278,8 +416,12 @@ fn check_unexpected_outbound(
     if connections.is_empty() {
         return;
     }
+    let ephemeral = network::local_port_range();
 
     for conn in &connections {
+        if network::is_inbound(conn, &config.network.allowed_listen_ports, tcp_listen_ports, ephemeral) {
+            continue;
+        }
         if network::is_allowed(conn, &config.network.allowed_remote_ports, &config.network.allowed_cidrs_v4) {
             continue;
         }
@@ -294,7 +436,10 @@ fn check_unexpected_outbound(
         let now = Instant::now();
         let event = rules::AnomalyEvent {
             kind: AnomalyKind::UnexpectedOutboundConnection,
-            detail: format!("conexion saliente a {}:{} fuera de los CIDRs permitidos", conn.remote_ip, conn.remote_port),
+            detail: format!(
+                "conexion saliente a {}:{} (puerto local {}) fuera de los CIDRs permitidos",
+                conn.remote_ip, conn.remote_port, conn.local_port
+            ),
         };
         dispatch(tx, cooldowns, pid, state, event, now);
     }
@@ -310,17 +455,13 @@ fn check_new_listen_ports(
     config: &Config,
     states: &HashMap<i32, ProcessState>,
     inode_to_pid: &HashMap<u64, i32>,
+    sockets: &[network::ListenSocket],
     tx: &SyncSender<TriggerJob>,
     cooldowns: &mut CooldownTracker,
     baseline: &mut Option<HashSet<(i32, u16, network::Protocol)>>,
 ) {
-    let mut sockets = network::parse_listen_tcp("/proc/net/tcp", false);
-    sockets.extend(network::parse_listen_tcp("/proc/net/tcp6", true));
-    sockets.extend(network::parse_listen_udp("/proc/net/udp", false));
-    sockets.extend(network::parse_listen_udp("/proc/net/udp6", true));
-
     let mut current: HashMap<(i32, u16, network::Protocol), &network::ListenSocket> = HashMap::new();
-    for sock in &sockets {
+    for sock in sockets {
         if let Some(&pid) = inode_to_pid.get(&sock.inode) {
             current.insert((pid, sock.local_port, sock.protocol), sock);
         }

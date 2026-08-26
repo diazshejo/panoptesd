@@ -24,6 +24,12 @@ workers que ejecuta `audit_script_path`. Las notificaciones de Telegram
 de las anomalias de arriba dispara ademas un mensaje 🚨, sin cambiar la
 logica de deteccion.
 
+Aparte del motor de reglas hay un monitor de **logins SSH exitosos**
+(`[ssh_watch]`, deshabilitado por defecto) que no hace polling de `/proc`:
+sigue el journal de sshd en tiempo real y manda un mensaje 🔑 por Telegram
+ante cada `Accepted password|publickey`, sin cooldown ni script de
+auditoria. Ver seccion "Monitoreo de logins SSH".
+
 ## Estructura del proyecto
 
 ```
@@ -41,6 +47,7 @@ panoptesd/
 │   ├── logging.rs       # tracing a stdout (journald) + archivo opcional
 │   ├── telegram.rs      # cliente ureq + formateo de los 3 tipos de mensaje
 │   ├── scheduler.rs     # hilos nativos: status cada 12h y resumen semanal
+│   ├── ssh_watch.rs     # hilo que sigue `journalctl -f` de sshd: alerta por login exitoso
 │   ├── hoststats.rs     # uptime/CPU/memoria/disco del servidor (/proc, statvfs)
 │   ├── history.rs       # historial en memoria de auditorias (para status/resumen)
 │   └── timefmt.rs       # timestamps UTC via libc, sin crate de fechas
@@ -214,23 +221,34 @@ Dos reglas independientes, ambas gateadas por el mismo
   releva la linea de base sin alertar, para no reportar como "nuevos" los
   puertos que ya estaban escuchando al iniciar.
 - **`conexion_saliente_no_esperada`**: de las conexiones TCP ESTABLISHED
-  (solo IPv4), la IP remota se valida contra `allowed_cidrs_v4` y el
-  puerto remoto contra `allowed_remote_ports`; si no matchea ninguno de
-  los dos, dispara la alerta.
+  (solo IPv4), primero se descartan las **entrantes** — `/proc/net/tcp`
+  no distingue el sentido de un socket establecido, y una sesion ssh
+  entrante (local 22, remoto efimero) se ve igual que una saliente. Se
+  considera entrante toda conexion cuyo puerto local es de servicio: esta
+  en `allowed_listen_ports`, es privilegiado (< 1024), tiene un socket
+  TCP en LISTEN en ese mismo ciclo, o cae fuera del rango efimero del
+  kernel (`/proc/sys/net/ipv4/ip_local_port_range`, 32768-60999 por
+  defecto). Esas conexiones no se evaluan por esta regla: si el puerto no
+  deberia estar escuchando, es asunto de `nuevo_puerto_listen`. Para las
+  salientes, la IP remota se valida contra `allowed_cidrs_v4` y el puerto
+  remoto contra `allowed_remote_ports`; si no matchea ninguno de los dos,
+  dispara la alerta. El puerto remoto no se usa para decidir el sentido a
+  proposito: una conexion efimero->efimero (un C2 escuchando en un puerto
+  alto) tiene que seguir llegando a la whitelist.
 
 Ambas reparten el mismo mapeo inodo->pid (el paso costoso) y usan el mismo
 `cooldown_secs` por (pid, tipo) que el resto de las reglas.
 
 ## Notificaciones por Telegram
 
-Opcional (`telegram.enabled = false` por defecto). Cubre tres tipos de
-mensaje, cada uno con un encabezado distinto para distinguirlos de un
-vistazo en el chat:
+Opcional (`telegram.enabled = false` por defecto). Cada tipo de mensaje
+lleva un encabezado distinto para distinguirlos de un vistazo en el chat:
 
 | Mensaje | Encabezado | Cuando se envia |
 |---|---|---|
 | Alerta de anomalia | 🚨 *Anomalia detectada* | Al momento de cada anomalia real (CPU, memoria, root fuera de whitelist, red, proceso efimero), respetando el mismo `cooldown_secs` que ya limita el disparo del script de auditoria. Incluye timestamp, PID, nombre de proceso, usuario, tipo de anomalia y la metrica/detalle que la disparo. |
 | Status periodico | 📊 *Status de panoptesd* | Cada `status_interval_hours` (12h por defecto). Uptime del servidor, %CPU y memoria (total/disponible), uso de disco por particion, cantidad de procesos vigilados, anomalias reales en las ultimas 12h, y version/uptime/ultima anomalia del propio daemon. |
+| Login SSH exitoso | 🔑 *Login SSH exitoso* | Al instante, por cada `Accepted password\|publickey` en el journal de sshd (requiere `[ssh_watch] enabled = true`). Sin cooldown. Incluye timestamp, usuario, IP de origen, puerto de origen y metodo de autenticacion. |
 | Resumen semanal | 🗂️ *Resumen semanal de auditoria* | En `weekly_summary_day`/`weekly_summary_hour` (domingo 23:00 UTC por defecto). Dispara ademas una auditoria de rutina programada y consolida todas las auditorias de la semana (por anomalia real o de rutina): cuantas corrieron, motivo de cada una y si el script de auditoria termino bien (✅) o con error (⚠️). Si no hubo ninguna anomalia real esa semana, el mensaje lo indica igual, sin necesidad de revisar logs. |
 
 ### Configurar el bot
@@ -259,6 +277,76 @@ El envio HTTP a la API de Telegram (via `ureq`, sincrono) corre solo en los
 hilos de los workers de auditoria y en los dos hilos de los schedulers —
 nunca en el loop principal de polling de `/proc`, asi que un timeout o una
 caida de red hacia Telegram no afecta la deteccion de anomalias.
+
+### Enviar un mensaje desde un script (`--send-telegram`)
+
+El mismo binario sirve para mandar un mensaje suelto al chat desde un cron
+o un script bash, sin arrancar el daemon:
+
+```bash
+panoptesd --send-telegram "backup_diario ok: $(date -Is)" --config /etc/panoptesd/config.toml
+```
+
+- Es "fire and exit": no arranca el loop de polling de `/proc`, ni los
+  workers de auditoria, ni los schedulers de status/semanal. Puede
+  correr en paralelo con el daemon ya activo.
+- Usa la misma seccion `[telegram]` de la config (`enabled`,
+  `request_timeout_secs`) y las mismas variables `TELEGRAM_BOT_TOKEN` /
+  `TELEGRAM_CHAT_ID` del entorno. Desde un cron, cargarlas antes:
+  `set -a; . /etc/panoptesd/telegram.env; set +a`.
+- El texto pasa por el mismo escape de Markdown que las alertas: se puede
+  pasar crudo (nombres de archivo con `_`, timestamps, `*`, `[`) sin
+  romper el envio. Llega con el encabezado 📣 *Mensaje de panoptesd*.
+- Codigos de salida, pensados para que un cron detecte el fallo:
+  `0` enviado — o `telegram.enabled = false`, en cuyo caso no manda nada y
+  no es error —, `1` fallo el envio (credenciales faltantes, error HTTP,
+  timeout) con el motivo en stderr, `2` uso invalido (falta el mensaje,
+  flag desconocido).
+
+## Monitoreo de logins SSH (`[ssh_watch]`, opcional)
+
+Modulo separado del motor de anomalias (`src/ssh_watch.rs`). Deshabilitado
+por defecto; con `enabled = true` el daemon lanza al arrancar:
+
+```
+journalctl -f -n 0 -o cat --no-pager -u <unit_name>
+```
+
+y un hilo dedicado lee su stdout linea por linea. No es polling: la
+lectura bloquea hasta que journald entrega una linea nueva, asi que sin
+logins no consume CPU. `-n 0` evita reproducir las ultimas lineas del
+journal al arrancar (o al relanzar), y `-o cat` deja solo el mensaje de
+sshd, que es lo que se parsea.
+
+Solo se reconoce el login exitoso:
+
+```
+Accepted (password|publickey) for <user> from <ip> port <port> ...
+```
+
+Cada match manda al instante un mensaje 🔑 por Telegram con usuario, IP y
+puerto de origen, metodo y timestamp, **sin cooldown** (un login exitoso
+es siempre relevante y poco frecuente). No pasa por el script de
+auditoria ni por el historial de anomalias. Intentos fallidos, baneos u
+otros patrones quedan deliberadamente fuera. Usuario e IP salen de texto
+libre del log y pasan por el mismo `escape_markdown()` que el resto de
+los campos dinamicos. Si `[telegram]` no esta habilitado (o faltan las
+credenciales), los logins solo se loguean en el journal del daemon.
+
+- `unit_name`: unit de systemd del servidor SSH. En Debian/Ubuntu es
+  `ssh.service` (default); en Fedora/RHEL/Arch es `sshd.service`. Confirmar
+  en el servidor con `systemctl status ssh` / `systemctl status sshd`
+  antes de habilitarlo — con una unit inexistente `journalctl` no falla,
+  simplemente nunca entrega lineas.
+- Si `journalctl` muere (rotacion de journald, señal, etc.) se loguea con
+  el exit status y se relanza a los 5s; si falla en cadena (binario
+  ausente, etc.) el reintento hace backoff hasta 60s. Nunca tumba el
+  daemon: el hilo es independiente del loop de `/proc`.
+- Al recibir `SIGTERM`, el daemon mata el `journalctl` hijo (es lo unico
+  que desbloquea la lectura) y espera al hilo antes de salir; no quedan
+  procesos huerfanos.
+- Necesita permiso de lectura del journal del sistema: corriendo como
+  root (como en `systemd/panoptesd.service`) ya lo tiene.
 
 ## Shutdown limpio
 
@@ -299,10 +387,15 @@ servidor de produccion:
    `TELEGRAM_CHAT_ID` en `/etc/panoptesd/telegram.env` (permisos `600`,
    nunca en el repo), y `telegram.enabled = true` en `config.toml`. Ver
    seccion "Notificaciones por Telegram" para el detalle completo.
-5. **Instalar y habilitar** siguiendo "Instalacion como servicio systemd"
+5. **`[ssh_watch]`** (si se va a habilitar): confirmar la unit real de
+   sshd en ese servidor (`systemctl status ssh` en Ubuntu deberia mostrar
+   `ssh.service`, el default; en Fedora/RHEL es `sshd.service`) y cargarla
+   en `unit_name`. Requiere `[telegram]` habilitado para que la alerta
+   llegue. Verificar con un login propio que llega el mensaje 🔑.
+6. **Instalar y habilitar** siguiendo "Instalacion como servicio systemd"
    mas arriba, terminando en `sudo systemctl enable --now panoptesd.service`
    (`enable`, no solo `start`, para que sobreviva un reinicio del server).
-6. **Verificar** con `systemctl status` + `journalctl -u panoptesd -f`
+7. **Verificar** con `systemctl status` + `journalctl -u panoptesd -f`
    durante un rato antes de darlo por andando, y confirmar que llega al
    menos un mensaje de Telegram (la alerta o, si no hay anomalias, esperar
    el primer status a las `status_interval_hours`).
@@ -322,3 +415,10 @@ servidor de produccion:
 - La deteccion de procesos efimeros depende del intervalo de polling: un
   proceso que vive menos que `poll_interval_secs` puede no llegar a
   observarse en ningun ciclo.
+- `ssh_watch` depende de `journalctl` y de que sshd loguee al journal de
+  systemd (lo normal en Ubuntu/Debian/Fedora). Un login que ocurra
+  mientras `journalctl` esta caido y esperando relanzarse (ventana de 5s)
+  no se reporta, porque `-n 0` no reproduce lineas anteriores al
+  relanzar. Solo cubre `password` y `publickey`; otros metodos
+  (`keyboard-interactive`, certificados via `publickey` si aparecen con
+  ese nombre, etc.) no disparan alerta.

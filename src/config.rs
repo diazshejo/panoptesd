@@ -35,6 +35,9 @@ pub struct Config {
 
     #[serde(default)]
     pub telegram: TelegramConfig,
+
+    #[serde(default)]
+    pub ssh_watch: SshWatchConfig,
 }
 
 fn default_log_level() -> String {
@@ -210,6 +213,32 @@ impl TelegramConfig {
             }
         }
     }
+}
+
+#[derive(Debug, Deserialize, Clone)]
+pub struct SshWatchConfig {
+    /// Habilita el hilo que sigue el journal de sshd (`journalctl -f`) y
+    /// alerta por Telegram ante cada login exitoso. Independiente del loop
+    /// de /proc y de las reglas: sin cooldown ni script de auditoria.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Unit de systemd del servidor SSH. "ssh.service" en Debian/Ubuntu;
+    /// en Fedora/RHEL/Arch es "sshd.service". Ajustable sin recompilar.
+    #[serde(default = "default_ssh_unit")]
+    pub unit_name: String,
+}
+
+impl Default for SshWatchConfig {
+    fn default() -> Self {
+        SshWatchConfig {
+            enabled: false,
+            unit_name: default_ssh_unit(),
+        }
+    }
+}
+
+fn default_ssh_unit() -> String {
+    "ssh.service".to_string()
 }
 
 impl Config {

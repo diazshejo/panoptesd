@@ -71,6 +71,10 @@ enabled = false
 check_every_n_cycles = 6
 
 # --- conexion_saliente_no_esperada (TCP ESTABLISHED, solo IPv4) ---
+# Solo evalua conexiones SALIENTES: las entrantes (puerto local en
+# allowed_listen_ports, < 1024, en LISTEN, o fuera del rango efimero del
+# kernel) se descartan, asi un login por ssh desde una IP externa no
+# dispara esta regla.
 # Puertos remotos considerados normales (a cualquier IP).
 allowed_remote_ports = [80, 443, 53, 123]
 # Rangos IPv4 esperados (notacion CIDR). Conexiones fuera de estos rangos
@@ -113,3 +117,21 @@ disk_paths = ["/"]
 # de monitoreo (las llamadas corren en los workers de auditoria y en los
 # hilos de los schedulers, nunca en el loop de /proc).
 request_timeout_secs = 5
+
+[ssh_watch]
+# Monitoreo de logins SSH exitosos en tiempo real. Es independiente del
+# loop de /proc y de las reglas: lanza `journalctl -f -u <unit_name> -o cat`
+# como subproceso y un hilo dedicado lee su stdout linea por linea
+# (bloqueante, sin polling: no consume CPU cuando no hay eventos). Cada
+# "Accepted password|publickey for <user> from <ip> port <port>" dispara
+# una alerta 🔑 a Telegram al instante, SIN cooldown (un login exitoso es
+# siempre relevante y poco frecuente). No pasa por el script de auditoria.
+# Solo cubre logins exitosos: no intentos fallidos ni otros patrones.
+# Requiere [telegram] enabled = true para que la alerta llegue; si no,
+# los logins solo quedan en el log del daemon. Si journalctl muere
+# (rotacion de journald, señal) se relanza solo tras unos segundos.
+enabled = false
+# Unit de systemd del servidor SSH: "ssh.service" en Debian/Ubuntu,
+# "sshd.service" en Fedora/RHEL/Arch. Confirmar con `systemctl status ssh`
+# o `systemctl status sshd` en el servidor.
+unit_name = "ssh.service"
