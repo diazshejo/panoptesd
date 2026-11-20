@@ -4,11 +4,11 @@ import subprocess
 import unittest
 from unittest.mock import patch
 
-ROOT = Path(__file__).resolve().parents[1]
+ROOT = Path(__file__).resolve().parents[2] / 'scripts' / 'backup-notify'
 
 
 def module(name):
-    spec = importlib.util.spec_from_file_location(name, ROOT / 'scripts' / (name + '.py'))
+    spec = importlib.util.spec_from_file_location(name, ROOT / (name + '.py'))
     result = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(result)
     return result

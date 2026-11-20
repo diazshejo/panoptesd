@@ -4,7 +4,7 @@ import subprocess
 import tempfile
 import unittest
 
-SCRIPT = Path(__file__).resolve().parents[1] / 'scripts' / 'backup-mysql.sh'
+SCRIPT = Path(__file__).resolve().parents[2] / 'scripts' / 'backup-notify' / 'backup-mysql.sh'
 
 
 class WeeklyBackup(unittest.TestCase):
