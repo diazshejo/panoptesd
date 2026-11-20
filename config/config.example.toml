@@ -56,6 +56,17 @@ sustained_secs = 10
 enabled = true
 # Agrupa auxiliares relacionados antes del primer aviso. 0 = sin espera.
 group_window_secs = 10
+# Herramientas con ejecutable root y sin escritura ajena deben persistir 10s.
+# Rutas desconocidas/borradas/inaccesibles avisan sin esta espera.
+# 0 restaura la deteccion inmediata tambien para herramientas del sistema.
+sustained_secs = 10
+# Se comprueban ruta exacta, propietario root y permisos de archivo/directorios.
+# Estos valores tambien se usan si una configuracion anterior omite el campo.
+# [] desactiva las excepciones por ejecutable. No incluir interpretes genericos.
+allowed_executables = [
+    "/usr/lib/systemd/systemd-executor", "/lib/systemd/systemd-executor",
+    "/usr/bin/systemd-tty-ask-password-agent", "/bin/systemd-tty-ask-password-agent",
+]
 # Los integrantes quedan en log; grupos persistentes vuelven tras cooldown.
 # No ampliar allowed_names con interpretes/herramientas genericas.
 # Nombres de proceso (comm, tal como aparece en /proc/<pid>/stat, max 15

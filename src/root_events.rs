@@ -6,26 +6,43 @@ use std::collections::HashMap;
 use std::os::unix::fs::MetadataExt;
 use std::time::{Duration, Instant};
 
-const PACKAGE_EXES: &[&str] = &[
+const GROUP_EXES: &[&str] = &[
     "/usr/bin/apt",
     "/usr/bin/apt-get",
     "/usr/bin/dpkg",
     "/usr/libexec/packagekitd",
     "/usr/lib/packagekit/packagekitd",
+    "/usr/bin/run-parts",
+    "/usr/bin/systemctl",
+    "/usr/sbin/sshd",
+    "/usr/lib/openssh/sshd-session",
 ];
 
-fn trusted_package_exe(exe: &str) -> bool {
-    if !PACKAGE_EXES.contains(&exe) {
+fn trusted_group_exe(exe: &str) -> bool {
+    if !GROUP_EXES.contains(&exe) {
         return false;
     }
     // Verificar ejecutable Y directorios: no confiar en comm ni argv[0].
-    std::path::Path::new(exe)
-        .ancestors()
-        .all(|path| std::fs::metadata(path).is_ok_and(|m| m.uid() == 0 && m.mode() & 0o022 == 0))
+    trusted_root_exe(exe)
+}
+
+pub fn trusted_root_exe(exe: &str) -> bool {
+    let path = std::path::Path::new(exe);
+    if !path.is_absolute() || !path.is_file() {
+        return false;
+    }
+    let Ok(resolved) = std::fs::canonicalize(path) else {
+        return false;
+    };
+    // Verificar tanto la ruta original como el destino de enlaces simbolicos.
+    [path, resolved.as_path()].iter().all(|p| {
+        p.ancestors()
+            .all(|a| std::fs::metadata(a).is_ok_and(|m| m.uid() == 0 && m.mode() & 0o022 == 0))
+    })
 }
 
 pub fn context(pid: i32, states: &HashMap<i32, ProcessState>) -> String {
-    context_with(pid, states, trusted_package_exe)
+    context_with(pid, states, trusted_group_exe)
 }
 
 fn context_with(
@@ -35,20 +52,31 @@ fn context_with(
 ) -> String {
     let origin = &states[&pid];
     let mut current_pid = pid;
-    let mut package = None;
-    // Ancestro de paquetes mas alto observado en este snapshot. El limite
+    let mut group = None;
+    // Ancestro de mantenimiento mas alto observado en este snapshot. El limite
     // tambien evita ciclos por una lectura concurrente de /proc.
     for _ in 0..64 {
         let Some(state) = states.get(&current_pid) else {
             break;
         };
-        if state.uid == 0 && state.exe.as_deref().is_some_and(&trusted) {
-            package = Some(format!(
-                "paquetes:{}:{}:{}",
+        let is_ssh = matches!(
+            state.exe.as_deref(),
+            Some("/usr/sbin/sshd" | "/usr/lib/openssh/sshd-session")
+        );
+        if state.uid == 0
+            && state.exe.as_deref().is_some_and(&trusted)
+            && !(is_ssh && state.ppid == 1)
+        {
+            group = Some(format!(
+                "actividad:{}:{}:{}",
                 current_pid,
                 state.starttime,
                 state.exe.as_deref().unwrap()
             ));
+        }
+        // La sesion SSH agrupa MOTD/shell/auxiliares; no el listener global.
+        if is_ssh && group.is_some() {
+            break;
         }
         if state.ppid <= 1 || state.ppid == current_pid {
             break;
@@ -61,12 +89,15 @@ fn context_with(
         }
         current_pid = state.ppid;
     }
-    package.unwrap_or_else(|| {
+    group.unwrap_or_else(|| {
         // Identidad conservadora: mismo ejecutable/comm y misma instancia
         // del padre agrupan auxiliares repetidos, no todos los shells del host.
-        let parent_start = states.get(&origin.ppid).map(|p| p.starttime);
+        let parent_start = states
+            .get(&origin.ppid)
+            .filter(|p| p.starttime <= origin.starttime)
+            .map(|p| p.starttime);
         match (&origin.exe, parent_start) {
-            (Some(exe), Some(start)) => format!(
+            (exe, Some(start)) => format!(
                 "exe:{exe:?}:comm:{:?}:padre:{}:{start}",
                 origin.comm, origin.ppid
             ),
@@ -124,7 +155,9 @@ impl RootBatches {
         );
         tracing::warn!(detail, "root fuera de whitelist: integrante de grupo");
         if batch.members.len() < 128 {
-            batch.members.insert(identity, detail);
+            batch
+                .members
+                .insert(identity, format!("{} (PID {pid})", state.comm));
         } else {
             batch.extra_observations += 1;
         }
@@ -141,10 +174,10 @@ impl RootBatches {
             if now.duration_since(batch.since) < window { return true; }
             let mut members: Vec<_> = batch.members.values().collect();
             members.sort();
-            let examples: Vec<_> = members.iter().take(8).map(|s| s.chars().take(220).collect::<String>()).collect();
+            let examples: Vec<_> = members.iter().take(3).map(|s| s.chars().take(160).collect::<String>()).collect();
             let mut job = batch.representative.clone();
-            let context_display: String = context.chars().take(200).collect();
-            job.detail = format!("Grupo root ({context_display}): {} procesos; {} observaciones adicionales. Muestra: {}. Integrantes completos en journal/log.",
+
+            job.detail = format!("Se observaron {} procesos con permisos de administrador fuera de la lista permitida ({} observaciones adicionales). Ejemplos: {}. El detalle completo está en el registro de panoptesd.",
                 members.len(), batch.extra_observations, examples.join("; "));
             !tx.enqueue(job, EventKey::Root(context.clone()), cooldowns, now)
         });
@@ -157,6 +190,58 @@ mod tests {
     use crate::rules;
     use crate::test_support::{config, state};
     use crate::trigger::test_channels;
+
+    #[test]
+    fn ssh_helpers_group_by_session_not_global_listener() {
+        let t = Instant::now();
+        let states = HashMap::from([
+            (10, state("sshd", "/usr/sbin/sshd", 1, 1, t)),
+            (20, state("sshd", "/usr/sbin/sshd", 10, 2, t)),
+            (21, state("sh", "/usr/bin/dash", 20, 3, t)),
+            (22, state("run-parts", "/usr/bin/run-parts", 21, 4, t)),
+            (
+                23,
+                state("landscape-sysin", "/usr/bin/python3.12", 22, 5, t),
+            ),
+            (30, state("sshd", "/usr/sbin/sshd", 10, 6, t)),
+            (31, state("sh", "/usr/bin/dash", 30, 7, t)),
+        ]);
+        let context = |pid| context_with(pid, &states, |e| GROUP_EXES.contains(&e));
+        assert_eq!(context(21), context(23));
+        assert_ne!(context(21), context(31));
+        assert_ne!(context(21), context(10));
+        assert_ne!(context_with(23, &states, |_| false), context(23));
+    }
+
+    #[test]
+    fn missing_exe_helpers_share_parent_context_without_hiding_them() {
+        let t = Instant::now();
+        let mut states = HashMap::from([
+            (1, state("systemd", "/usr/lib/systemd/systemd", 0, 1, t)),
+            (100, state("(sd-close)", "", 1, 10, t)),
+            (101, state("(sd-close)", "", 1, 11, t)),
+            (102, state("other", "", 1, 12, t)),
+        ]);
+        for pid in [100, 101, 102] {
+            states.get_mut(&pid).unwrap().exe = None;
+        }
+        assert_eq!(context(100, &states), context(101, &states));
+        assert_ne!(context(100, &states), context(102, &states));
+        let mut batches = RootBatches::default();
+        for pid in [100, 101] {
+            batches.observe(context(pid, &states), pid, &states[&pid], t);
+        }
+        let (tx, rx, _) = test_channels(8);
+        batches.flush(
+            Duration::ZERO,
+            t,
+            &tx,
+            &CooldownTracker::new(Duration::ZERO),
+        );
+        let job = rx.try_recv().unwrap();
+        assert!(job.detail.contains("2 procesos"));
+        assert!(rx.try_recv().is_err());
+    }
 
     #[test]
     fn package_update_groups_helpers_without_authorizing_generic_names() {
@@ -173,7 +258,7 @@ mod tests {
             (200, state("sh", "/tmp/sh", 1, 15, now)),
             (201, state("apt-get", "/tmp/apt-get", 1, 16, now)),
         ]);
-        let context = |pid| context_with(pid, &states, |e| PACKAGE_EXES.contains(&e));
+        let context = |pid| context_with(pid, &states, |e| GROUP_EXES.contains(&e));
         for pid in 101..=104 {
             assert_eq!(context(pid), context(100));
         }
@@ -222,6 +307,6 @@ mod tests {
         assert!(rx.try_recv().is_err());
         // Aunque PID 501 ya no se observe, no se descarta su evidencia.
         batches.flush(Duration::ZERO, t + Duration::from_secs(30), &tx, &cooldowns);
-        assert!(rx.try_recv().unwrap().detail.contains("pid=501"));
+        assert!(rx.try_recv().unwrap().detail.contains("PID 501"));
     }
 }

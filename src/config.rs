@@ -111,9 +111,27 @@ pub struct RootWhitelistConfig {
     /// Nombres de proceso (comm, tal como aparece en /proc/<pid>/stat)
     /// permitidos para correr como root sin generar alerta.
     pub allowed_names: Vec<String>,
+    /// Rutas exactas; se exige propietario root y sin escritura de grupo/otros.
+    #[serde(default = "default_root_executables")]
+    pub allowed_executables: Vec<String>,
+    /// Espera solo para herramientas de sistema con ruta/permisos confiables.
+    #[serde(default = "default_group_window")]
+    pub sustained_secs: u64,
     /// Ventana para agrupar eventos relacionados; no es una whitelist.
     #[serde(default = "default_group_window")]
     pub group_window_secs: u64,
+}
+
+fn default_root_executables() -> Vec<String> {
+    [
+        "/usr/lib/systemd/systemd-executor",
+        "/lib/systemd/systemd-executor",
+        "/usr/bin/systemd-tty-ask-password-agent",
+        "/bin/systemd-tty-ask-password-agent",
+    ]
+    .into_iter()
+    .map(String::from)
+    .collect()
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -332,6 +350,22 @@ impl Config {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn old_root_config_gets_helper_defaults() {
+        let root: RootWhitelistConfig =
+            toml::from_str("enabled = true\nallowed_names = []").unwrap();
+        assert_eq!(root.sustained_secs, 10);
+        assert!(root
+            .allowed_executables
+            .contains(&"/usr/lib/systemd/systemd-executor".into()));
+        let root: RootWhitelistConfig = toml::from_str(
+            "enabled = true\nallowed_names = []\nallowed_executables = []\nsustained_secs = 0",
+        )
+        .unwrap();
+        assert!(root.allowed_executables.is_empty());
+        assert_eq!(root.sustained_secs, 0);
+    }
+
     #[test]
     fn example_and_old_config_load_with_host_protection() {
         let cfg = crate::test_support::config();

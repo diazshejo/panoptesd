@@ -101,9 +101,27 @@ pub fn evaluate(
     }
 
     let root_cfg = &config.rules.root_whitelist;
-    if root_cfg.enabled && state.uid == 0 && !is_kernel_thread(state.flags) && !state.is_audit {
-        let allowed = root_cfg.allowed_names.iter().any(|n| n == &state.comm);
+    if root_cfg.enabled
+        && state.uid == 0
+        && !is_kernel_thread(state.flags)
+        && !state.is_audit
+        && state.flags & 0x4 == 0
+    {
+        let allowed = root_cfg.allowed_names.iter().any(|n| n == &state.comm)
+            || state.exe.as_deref().is_some_and(|exe| {
+                root_cfg.allowed_executables.iter().any(|p| p == exe)
+                    && crate::root_events::trusted_root_exe(exe)
+            });
         if !allowed {
+            let since = *state.root_over_since.get_or_insert(now);
+            let trusted = state
+                .exe
+                .as_deref()
+                .is_some_and(crate::root_events::trusted_root_exe);
+            // No retrasar ejecutables desconocidos, borrados o inaccesibles.
+            if trusted && now.duration_since(since).as_secs() < root_cfg.sustained_secs {
+                return events;
+            }
             events.push(AnomalyEvent {
                 kind: AnomalyKind::RootNotWhitelisted,
                 detail: format!(
@@ -111,7 +129,11 @@ pub fn evaluate(
                     state.comm
                 ),
             });
+        } else {
+            state.root_over_since = None;
         }
+    } else {
+        state.root_over_since = None;
     }
 
     events
@@ -194,6 +216,48 @@ mod tests {
     use super::*;
     use crate::test_support::{config, state};
     use std::time::Duration;
+
+    #[test]
+    fn routine_tools_require_persistence_but_unknown_executables_alert_immediately() {
+        let mut cfg = config();
+        cfg.rules.root_whitelist.sustained_secs = 10;
+        let t = Instant::now();
+        let mut s = state("helper", "/usr/bin/true", 1, 42, t);
+        assert!(evaluate(&cfg, 42, &mut s, t).is_empty());
+        assert!(evaluate(&cfg, 42, &mut s, t + Duration::from_secs(9)).is_empty());
+        assert!(evaluate(&cfg, 42, &mut s, t + Duration::from_secs(10))
+            .iter()
+            .any(|e| e.kind == AnomalyKind::RootNotWhitelisted));
+        let mut unknown = state("helper", "/tmp/untrusted-helper", 1, 43, t);
+        assert!(!evaluate(&cfg, 43, &mut unknown, t).is_empty());
+        unknown.exe = None;
+        assert!(!evaluate(&cfg, 43, &mut unknown, t).is_empty());
+        // PF_EXITING: ya esta terminando; no iniciar una nueva alerta root.
+        unknown.flags = 0x4;
+        assert!(evaluate(&cfg, 43, &mut unknown, t).is_empty());
+    }
+
+    #[test]
+    fn executable_allowlist_requires_exact_trusted_path_not_comm() {
+        let mut cfg = config();
+        cfg.rules.root_whitelist.allowed_executables = vec!["/usr/bin/true".into()];
+        let now = Instant::now();
+        assert!(crate::root_events::trusted_root_exe("/usr/bin/true"));
+        let mut s = state("9", "/usr/bin/true", 1, 42, now);
+        assert!(evaluate(&cfg, 1234, &mut s, now).is_empty());
+        for exe in [
+            Some("/tmp/true".into()),
+            Some("/usr/bin/true (deleted)".into()),
+            None,
+        ] {
+            s.exe = exe;
+            assert!(evaluate(&cfg, 1234, &mut s, now)
+                .iter()
+                .any(|e| e.kind == AnomalyKind::RootNotWhitelisted));
+        }
+        assert!(!crate::root_events::trusted_root_exe("relative/path"));
+        assert!(!crate::root_events::trusted_root_exe("/usr/bin"));
+    }
 
     #[test]
     fn unexpected_root_including_deleted_or_unreadable_exe_still_alerts() {

@@ -496,3 +496,36 @@ root inesperado, auditoria sin recursion, presion sostenida, umbrales,
 reintentos, separacion de colas y cooldown tras confirmacion.
 
 Ver [informe de evidencia y pendientes](docs/diagnostico-polybot.md).
+
+## Reducción de avisos por auxiliares (noviembre de 2026)
+
+La regla root espera `rules.root_whitelist.sustained_secs` (10 segundos por
+omisión) antes de avisar por herramientas cuyo ejecutable y directorios
+pertenecen a root y no permiten escritura a grupo/otros. Así las tareas breves
+de mantenimiento no disparan una alarma por cada auxiliar. Los ejecutables
+sin ruta verificable, borrados o no confiables siguen avisando inmediatamente.
+Los procesos con PF_EXITING ya están terminando y no originan avisos root nuevos.
+Esta espera reduce también la detección de usos maliciosos breves de herramientas
+del sistema: usar `sustained_secs = 0` si se necesita detectar cada ejecución.
+CPU, memoria y logins SSH mantienen sus reglas y umbrales.
+
+`allowed_executables` permite rutas exactas y verificadas de systemd-executor
+y systemd-tty-ask-password-agent, independientemente de su nombre temporal.
+El valor `[]` desactiva estas excepciones. No agregar intérpretes genéricos.
+Los valores por omisión se aplican también a configuraciones anteriores.
+
+Los auxiliares sin exe se agrupan por nombre e instancia del padre; una ráfaga
+de `(sd-close)` produce un grupo, no un mensaje por PID. Las tareas de paquetes,
+run-parts, systemctl y auxiliares de una misma sesión SSH se agrupan por ancestro
+verificado. La agrupación no autoriza procesos; los detalles permanecen en el log.
+Las sesiones SSH distintas no comparten el grupo del listener global.
+
+Telegram muestra un título descriptivo, qué pasó y qué revisar, con PID y tipo
+como referencias. Los avisos root indican actividad para revisar, no una intrusión
+confirmada. El disco continúa incluido en el reporte periódico de estado; no existe
+una alarma independiente de espacio bajo en esta versión.
+
+Los backups externos deben invocar `--send-telegram` explícitamente y disponer de
+las variables TELEGRAM_BOT_TOKEN/TELEGRAM_CHAT_ID en **su propio entorno**. El
+EnvironmentFile del servicio panoptesd no se hereda en otro servicio o cron.
+El resultado del backup y el resultado del envío deben registrarse por separado.

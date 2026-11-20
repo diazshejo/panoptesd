@@ -124,3 +124,13 @@ Primer release publico (open source) de panoptesd.
 - Unit de systemd de ejemplo (`systemd/panoptesd.service`).
 
 [0.1.0]: https://github.com/diazshejo/panoptesd/releases/tag/v0.1.0
+
+## 2026-11-19 — Auxiliares y mensajes claros
+
+- Espera configurable para herramientas root verificadas; detección inmediata
+  para ejecutables desconocidos, borrados o inaccesibles; sin avisos root nuevos
+  para procesos que ya están terminando.
+- Excepciones por ruta y permisos para los ejecutables específicos de systemd.
+- Agrupación de auxiliares sin exe y de tareas de mantenimiento/sesiones SSH.
+- Mensajes de Telegram con explicación y acción sugerida; muestras de grupos
+  breves y detalles completos en log. Reglas de memoria y login sin cambios.

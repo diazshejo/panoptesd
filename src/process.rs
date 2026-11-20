@@ -146,6 +146,7 @@ pub struct ProcessState {
     pub last_sample_at: Instant,
     pub cpu_percent: f32,
     pub cpu_over_since: Option<Instant>,
+    pub root_over_since: Option<Instant>,
     pub rss_bytes: u64,
     pub first_seen: Instant,
     pub last_seen: Instant,
@@ -168,6 +169,7 @@ impl ProcessState {
             last_sample_at: now,
             cpu_percent: 0.0,
             cpu_over_since: None,
+            root_over_since: None,
             rss_bytes: sample.rss_bytes,
             first_seen: now,
             last_seen: now,
@@ -185,6 +187,9 @@ impl ProcessState {
                 .saturating_sub(self.last_utime.saturating_add(self.last_stime));
             let delta_secs = delta_ticks as f32 / ticks_per_sec as f32;
             self.cpu_percent = (delta_secs / elapsed) * 100.0;
+        }
+        if sample.comm != self.comm || sample.exe != self.exe || sample.uid != self.uid {
+            self.root_over_since = None;
         }
         if sample.comm != self.comm {
             self.comm = sample.comm.clone();

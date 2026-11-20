@@ -98,18 +98,44 @@ pub fn format_anomaly_alert(
     detail: &str,
     timestamp: &str,
 ) -> String {
+    let (title, explanation, action) = match kind {
+        "root_not_whitelisted" => ("🔎 Actividad de administrador para revisar",
+            "Un proceso usó permisos de administrador y no figura entre los permitidos. Esto no confirma una intrusión.",
+            "Comprueba si coincide con una actualización, un inicio de sesión o una tarea de mantenimiento."),
+        "memory_out_of_range" => ("🧠 Consumo de memoria elevado",
+            "El proceso superó el límite de memoria configurado.",
+            "Revisa su carga de trabajo y el consumo de memoria del servidor."),
+        "host_memory_pressure" => ("🚨 El servidor tiene poca memoria disponible",
+            "La memoria disponible se mantuvo por debajo del margen configurado.",
+            "Revisa los procesos que más memoria consumen y los límites de los servicios."),
+        "cpu_sustained" => ("⚙️ Uso de CPU elevado",
+            "El proceso mantuvo un consumo de CPU superior al límite configurado.",
+            "Comprueba si está ejecutando una tarea intensiva prevista."),
+        "nuevo_puerto_listen" => ("🌐 Nuevo puerto abierto",
+            "Un proceso comenzó a escuchar en un puerto no previsto.",
+            "Comprueba si corresponde a un servicio que acabas de iniciar."),
+        "conexion_saliente_no_esperada" => ("🌐 Conexión de red para revisar",
+            "Se detectó una conexión fuera de los destinos permitidos.",
+            "Verifica que el destino sea necesario para este proceso."),
+        "ephemeral_process" => ("🔎 Proceso de corta duración",
+            "Se observó un proceso durante un intervalo breve. Puede ser una tarea normal del sistema.",
+            "Revisa su origen si no reconoces la actividad."),
+        _ => ("🔎 Aviso de panoptesd", "Se detectó una actividad para revisar.", "Consulta el registro para más contexto."),
+    };
     format!(
-        "🚨 *Anomalia detectada*\n\
-         *Timestamp:* {timestamp}\n\
-         *PID:* `{pid}`\n\
+        "{title}\n\n{explanation}\n\n\
          *Proceso:* {}\n\
          *Usuario:* {}\n\
-         *Tipo:* {}\n\
-         *Detalle:* {}",
+         *PID:* `{pid}`\n\
+         *Hora:* {}\n\n\
+         *Qué pasó:* {}\n\n\
+         *Qué revisar:* {action}\n\n\
+         *Referencia:* {}",
         code_span(name),
         escape_markdown(user),
-        escape_markdown(kind),
+        escape_markdown(timestamp),
         escape_markdown(detail),
+        escape_markdown(kind),
     )
 }
 
@@ -403,13 +429,13 @@ pub(crate) mod tests {
             "conexion a 10.0.0.1:443 desde *algo* raro_",
             "2026-08-25 10:00:00 UTC",
         );
-        assert!(msg.contains("*Tipo:* conexion\\_saliente\\_no\\_esperada"));
+        assert!(msg.contains("*Referencia:* conexion\\_saliente\\_no\\_esperada"));
         assert!(msg.contains("*Usuario:* svc\\_user"));
-        assert!(msg.contains("*Detalle:* conexion a 10.0.0.1:443 desde \\*algo\\* raro\\_"));
+        assert!(msg.contains("*Qué pasó:* conexion a 10.0.0.1:443 desde \\*algo\\* raro\\_"));
         // nombre de proceso va en code span sin escapes
         assert!(msg.contains("*Proceso:* `python3_worker`"));
         // los encabezados en negrita se conservan sin escapar
-        assert!(msg.starts_with("🚨 *Anomalia detectada*\n"));
+        assert!(msg.starts_with("🌐 Conexión de red para revisar\n"));
         assert!(msg.contains("*PID:* `42`"));
     }
 

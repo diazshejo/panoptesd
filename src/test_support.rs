@@ -5,7 +5,9 @@ use crate::{
 use std::time::Instant;
 
 pub fn config() -> Config {
-    toml::from_str(include_str!("../config/config.example.toml")).unwrap()
+    let mut cfg: Config = toml::from_str(include_str!("../config/config.example.toml")).unwrap();
+    cfg.rules.root_whitelist.sustained_secs = 0;
+    cfg
 }
 
 pub fn state(comm: &str, exe: &str, ppid: i32, start: u64, now: Instant) -> ProcessState {
