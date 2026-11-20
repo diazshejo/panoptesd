@@ -529,3 +529,25 @@ Los backups externos deben invocar `--send-telegram` explícitamente y disponer 
 las variables TELEGRAM_BOT_TOKEN/TELEGRAM_CHAT_ID en **su propio entorno**. El
 EnvironmentFile del servicio panoptesd no se hereda en otro servicio o cron.
 El resultado del backup y el resultado del envío deben registrarse por separado.
+
+### Avisos de backups en dropsmart
+
+El backup semanal `dropsmart-backup.service` ejecuta el script de MySQL y usa
+`systemd/backup-notify/backup-notification.conf` para avisar el resultado por
+Telegram. El envío fallido queda registrado en el journal y no cambia el
+resultado del backup. Las credenciales las carga systemd desde el archivo
+protegido `/etc/panoptesd/telegram.env`.
+
+El backup de despliegue utiliza el lanzador
+`scripts/backup-notify/dropsmart-deploy-backup.py`, instalado en el servidor como
+`/home/deploy/dropsmart-release-20261119/backup.py`. Este ejecuta el respaldo
+original conservado como `backup_original_20261119.py` a través de
+`run-backup-notified.py`, manteniendo el usuario de ejecución y el código de
+salida del backup. Las rutas corresponden a este despliegue y deben adaptarse si
+se mueve. El servicio de aviso usa mensajes fijos y la regla sudoers solo permite
+iniciar esas unidades, sin dar acceso al archivo de credenciales.
+
+El 19 de noviembre de 2026 se ejecutó una prueba real: se verificaron el volcado
+y el archivo de uploads, y se confirmó la recepción del aviso. El contenido del
+backup y el script original de despliegue permanecen en el servidor; no se
+incluyen en este repositorio.
