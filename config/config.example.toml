@@ -16,13 +16,16 @@ log_file = "/var/log/panoptesd/panoptesd.log"
 # Script bash que se ejecuta ante cada anomalia detectada.
 audit_script_path = "/opt/panoptesd/scripts/auditoria.sh"
 
-# Cooldown en segundos: no se vuelve a disparar el mismo (pid, tipo de
-# anomalia) dentro de esta ventana.
+# Cooldown desde la confirmacion de Telegram (o registro local si esta
+# deshabilitado). Clave: PID+inicio+tipo; root por contexto; host independiente.
+# Fallo de envio/cola llena no consume cooldown.
 cooldown_secs = 300
 
 # Hilos del pool que ejecutan el script de auditoria (no bloquean el loop
 # de monitoreo). 2 alcanza para la mayoria de los casos.
 script_worker_threads = 2
+# Limita cada auditoria y termina sus auxiliares al finalizar.
+audit_timeout_secs = 30
 
 [rules.cpu]
 enabled = true
@@ -33,11 +36,28 @@ sustained_secs = 60
 
 [rules.memory]
 enabled = true
-# RSS maximo esperado por proceso, en MB.
-max_rss_mb = 2048
+# RSS por proceso, en MiB (no suma hijos ni swap). Ajustar al workload y
+# memory.max del servicio. El valor anterior, 2048, supera la RAM del
+# servidor de ~1.9 GiB mostrado en alertas .txt y no sirve como alarma pre-OOM.
+max_rss_mb = 768
+
+[rules.host_memory]
+# Tambien habilitado por defecto si esta seccion se omite en configs antiguas.
+enabled = true
+# Alerta si MemAvailable cae por debajo de CUALQUIERA de estos umbrales.
+# 0 desactiva solo ese umbral. Unidades MiB / porcentaje de MemTotal.
+min_available_mb = 256
+min_available_percent = 15.0
+sustained_secs = 10
+# Con polling=5: deteccion aprox. 10..15s tras comenzar la presion, mas envio.
+# No garantiza anticipar OOM instantaneo ni un limite de cgroup menor al host.
 
 [rules.root_whitelist]
 enabled = true
+# Agrupa auxiliares relacionados antes del primer aviso. 0 = sin espera.
+group_window_secs = 10
+# Los integrantes quedan en log; grupos persistentes vuelven tras cooldown.
+# No ampliar allowed_names con interpretes/herramientas genericas.
 # Nombres de proceso (comm, tal como aparece en /proc/<pid>/stat, max 15
 # caracteres del lado del kernel) permitidos para correr como root.
 allowed_names = [
@@ -95,8 +115,7 @@ allowed_listen_ports = [22]
 # El token del bot y el chat_id NUNCA van en este archivo: se leen de las
 # variables de entorno TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID (ver
 # systemd/panoptesd.service, EnvironmentFile). Si enabled=true pero las
-# variables no estan seteadas, el daemon arranca igual y solo loguea un
-# error: Telegram queda deshabilitado para esa corrida.
+# variables no estan seteadas, el daemon falla al iniciar con un error claro.
 enabled = false
 
 # Cada cuantas horas se envia el reporte de status (uptime, CPU, memoria,
@@ -113,9 +132,9 @@ weekly_summary_hour = 23
 disk_paths = ["/"]
 
 # Timeout (segundos) de las llamadas HTTP a la API de Telegram. Si se
-# supera, el envio falla y solo se loguea: nunca bloquea el loop principal
-# de monitoreo (las llamadas corren en los workers de auditoria y en los
-# hilos de los schedulers, nunca en el loop de /proc).
+# supera, las alertas se reintentan hasta 3 veces y queda el error en log.
+# Las alertas de memoria tienen cola/hilo propios, separados de root y scripts.
+# Un fallo no confirma cooldown; si persiste se reevalua en el siguiente polling.
 request_timeout_secs = 5
 
 [ssh_watch]

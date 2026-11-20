@@ -67,7 +67,11 @@ pub struct SshLogin {
     pub port: u16,
 }
 
-pub fn spawn(config: Arc<Config>, shutdown: Arc<AtomicBool>, telegram: Option<Arc<TelegramClient>>) -> SshWatchHandle {
+pub fn spawn(
+    config: Arc<Config>,
+    shutdown: Arc<AtomicBool>,
+    telegram: Option<Arc<TelegramClient>>,
+) -> SshWatchHandle {
     let child: Arc<Mutex<Option<Child>>> = Arc::new(Mutex::new(None));
     let child_slot = Arc::clone(&child);
     let thread = thread::Builder::new()
@@ -77,7 +81,12 @@ pub fn spawn(config: Arc<Config>, shutdown: Arc<AtomicBool>, telegram: Option<Ar
     SshWatchHandle { child, thread }
 }
 
-fn run(config: &Config, shutdown: &AtomicBool, telegram: Option<&TelegramClient>, child_slot: &Mutex<Option<Child>>) {
+fn run(
+    config: &Config,
+    shutdown: &AtomicBool,
+    telegram: Option<&TelegramClient>,
+    child_slot: &Mutex<Option<Child>>,
+) {
     let unit = config.ssh_watch.unit_name.as_str();
     if telegram.is_none() {
         tracing::warn!(
@@ -118,7 +127,11 @@ fn run(config: &Config, shutdown: &AtomicBool, telegram: Option<&TelegramClient>
         if started.elapsed() >= HEALTHY_RUN {
             delay = RETRY_DELAY_MIN;
         }
-        tracing::warn!(unit, retry_secs = delay.as_secs(), "ssh_watch: relanzando journalctl");
+        tracing::warn!(
+            unit,
+            retry_secs = delay.as_secs(),
+            "ssh_watch: relanzando journalctl"
+        );
         signals::sleep_interruptible(delay, shutdown);
         delay = (delay * 2).min(RETRY_DELAY_MAX);
     }
@@ -197,7 +210,13 @@ fn handle_login(login: &SshLogin, telegram: Option<&TelegramClient>) {
         "login SSH exitoso"
     );
     if let Some(client) = telegram {
-        let text = telegram::format_ssh_login_alert(&login.user, &login.ip, &login.method, login.port, &timestamp);
+        let text = telegram::format_ssh_login_alert(
+            &login.user,
+            &login.ip,
+            &login.method,
+            login.port,
+            &timestamp,
+        );
         if let Err(e) = client.send(&text) {
             tracing::error!(error = %e, "ssh_watch: fallo el envio de la alerta de login a Telegram");
         }
@@ -287,7 +306,10 @@ mod tests {
             "Accepted publickey for sdiaz from 192.168.1.50 port 99999 ssh2",
             "",
         ] {
-            assert!(parse_accepted(line).is_none(), "no deberia matchear: {line:?}");
+            assert!(
+                parse_accepted(line).is_none(),
+                "no deberia matchear: {line:?}"
+            );
         }
     }
 }

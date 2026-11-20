@@ -11,7 +11,7 @@ use crate::hoststats::DiskUsage;
 use std::time::Duration;
 
 pub struct TelegramClient {
-    token: String,
+    endpoint: String,
     chat_id: String,
     agent: ureq::Agent,
 }
@@ -19,7 +19,11 @@ pub struct TelegramClient {
 impl TelegramClient {
     pub fn new(token: String, chat_id: String, timeout: Duration) -> Self {
         let agent = ureq::AgentBuilder::new().timeout(timeout).build();
-        TelegramClient { token, chat_id, agent }
+        TelegramClient {
+            endpoint: format!("https://api.telegram.org/bot{token}/sendMessage"),
+            chat_id,
+            agent,
+        }
     }
 
     /// Envia `text` como mensaje de Telegram (Markdown legacy). Bloquea el
@@ -27,16 +31,32 @@ impl TelegramClient {
     /// loop principal de monitoreo, solo desde los workers de auditoria y
     /// los threads de los schedulers.
     pub fn send(&self, text: &str) -> Result<(), String> {
-        let url = format!("https://api.telegram.org/bot{}/sendMessage", self.token);
-        self.agent
-            .post(&url)
-            .send_form(&[
-                ("chat_id", self.chat_id.as_str()),
-                ("text", text),
-                ("parse_mode", "Markdown"),
-            ])
-            .map(|_| ())
-            .map_err(|e| e.to_string())
+        let response = self.agent.post(&self.endpoint).send_form(&[
+            ("chat_id", self.chat_id.as_str()),
+            ("text", text),
+            ("parse_mode", "Markdown"),
+        ]);
+        let response = match response {
+            Ok(r) => r,
+            // Nunca mostrar e.to_string(): ureq incluye la URL con el token.
+            Err(ureq::Error::Status(code, _)) => return Err(format!("Telegram HTTP {code}")),
+            Err(ureq::Error::Transport(_)) => {
+                return Err("Telegram: fallo de transporte/timeout".into())
+            }
+        };
+        use std::io::Read;
+        let mut body = String::new();
+        response
+            .into_reader()
+            .take(65536)
+            .read_to_string(&mut body)
+            .map_err(|_| "Telegram: respuesta ilegible")?;
+        let value: serde_json::Value =
+            serde_json::from_str(&body).map_err(|_| "Telegram: JSON invalido")?;
+        if value.get("ok").and_then(|v| v.as_bool()) != Some(true) {
+            return Err("Telegram no confirmo ok=true".into());
+        }
+        Ok(())
     }
 }
 
@@ -70,7 +90,14 @@ fn code_span(s: &str) -> String {
     format!("`{}`", s.replace('`', "'"))
 }
 
-pub fn format_anomaly_alert(pid: i32, name: &str, user: &str, kind: &str, detail: &str, timestamp: &str) -> String {
+pub fn format_anomaly_alert(
+    pid: i32,
+    name: &str,
+    user: &str,
+    kind: &str,
+    detail: &str,
+    timestamp: &str,
+) -> String {
     format!(
         "🚨 *Anomalia detectada*\n\
          *Timestamp:* {timestamp}\n\
@@ -90,7 +117,13 @@ pub fn format_anomaly_alert(pid: i32, name: &str, user: &str, kind: &str, detail
 /// libre del journal de sshd, asi que se escapan igual que los campos
 /// dinamicos de las alertas de anomalia; el metodo tambien, por si el
 /// parser algun dia acepta variantes con `_`/`-`.
-pub fn format_ssh_login_alert(user: &str, ip: &str, method: &str, port: u16, timestamp: &str) -> String {
+pub fn format_ssh_login_alert(
+    user: &str,
+    ip: &str,
+    method: &str,
+    port: u16,
+    timestamp: &str,
+) -> String {
     format!(
         "🔑 *Login SSH exitoso*\n\
          *Timestamp:* {timestamp}\n\
@@ -199,7 +232,10 @@ pub fn format_status_report(
 }
 
 pub fn format_weekly_summary(records: &[AuditRecord], week_start: &str, week_end: &str) -> String {
-    let anomalies: Vec<&AuditRecord> = records.iter().filter(|r| r.kind.is_real_anomaly()).collect();
+    let anomalies: Vec<&AuditRecord> = records
+        .iter()
+        .filter(|r| r.kind.is_real_anomaly())
+        .collect();
     let routine_count = records.len() - anomalies.len();
 
     if anomalies.is_empty() {
@@ -229,7 +265,11 @@ pub fn format_weekly_summary(records: &[AuditRecord], week_start: &str, week_end
 
     for a in &anomalies {
         let ts = crate::timefmt::format_utc(a.unix_ts);
-        let script_marker = if a.script_success { "✅" } else { "⚠️ script fallo" };
+        let script_marker = if a.script_success {
+            "✅"
+        } else {
+            "⚠️ script fallo"
+        };
         msg.push_str(&format!(
             "• {ts} — PID `{}` {} ({}) — *{}*: {} \\[{script_marker}]\n",
             a.pid,
@@ -244,8 +284,71 @@ pub fn format_weekly_summary(records: &[AuditRecord], week_start: &str, week_end
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
+
+    pub fn mock_client(
+        responses: Vec<(u16, &'static str)>,
+    ) -> (TelegramClient, std::thread::JoinHandle<Vec<String>>) {
+        use std::io::{BufRead, BufReader, Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let endpoint = format!(
+            "http://{}/botTEST/sendMessage",
+            listener.local_addr().unwrap()
+        );
+        let server = std::thread::spawn(move || {
+            let mut requests = Vec::new();
+            for (status, body) in responses {
+                let (mut socket, _) = listener.accept().unwrap();
+                socket
+                    .set_read_timeout(Some(Duration::from_secs(10)))
+                    .unwrap();
+                let mut reader = BufReader::new(socket.try_clone().unwrap());
+                let mut header = String::new();
+                let mut length = 0;
+                loop {
+                    let mut line = String::new();
+                    reader.read_line(&mut line).unwrap();
+                    if line == "\r\n" {
+                        break;
+                    }
+                    if let Some(v) = line.to_lowercase().strip_prefix("content-length:") {
+                        length = v.trim().parse::<usize>().unwrap();
+                    }
+                    header.push_str(&line);
+                }
+                let mut data = vec![0; length];
+                reader.read_exact(&mut data).unwrap();
+                requests.push(format!("{header}{}", String::from_utf8(data).unwrap()));
+                write!(socket, "HTTP/1.1 {status} Test\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
+            }
+            requests
+        });
+        (
+            TelegramClient {
+                endpoint,
+                chat_id: "test-chat".into(),
+                agent: ureq::AgentBuilder::new()
+                    .timeout(Duration::from_secs(2))
+                    .build(),
+            },
+            server,
+        )
+    }
+
+    #[test]
+    fn validates_api_ack_and_does_not_expose_token_in_errors() {
+        for (status, body) in [
+            (200, r#"{"ok":false}"#),
+            (200, "bad json"),
+            (401, r#"{"ok":false}"#),
+        ] {
+            let (client, server) = mock_client(vec![(status, body)]);
+            let err = client.send("memory").unwrap_err();
+            assert!(!err.contains("botTEST"));
+            server.join().unwrap();
+        }
+    }
 
     #[test]
     fn escape_markdown_escapes_only_legacy_special_chars() {
@@ -269,7 +372,13 @@ mod tests {
 
     #[test]
     fn ssh_login_alert_escapes_user_and_ip_but_keeps_header() {
-        let msg = format_ssh_login_alert("deploy_bot", "10.0.0.1", "publickey", 51234, "2026-08-25 10:00:00 UTC");
+        let msg = format_ssh_login_alert(
+            "deploy_bot",
+            "10.0.0.1",
+            "publickey",
+            51234,
+            "2026-08-25 10:00:00 UTC",
+        );
         assert!(msg.starts_with("🔑 *Login SSH exitoso*\n"));
         assert!(msg.contains("*Usuario:* deploy\\_bot\n"));
         assert!(msg.contains("*Origen:* 10.0.0.1\n"));
@@ -322,7 +431,10 @@ mod tests {
                 }
                 i += 1;
             }
-            assert_eq!(unescaped_underscores, 0, "linea con `_` sin escapar: {line}");
+            assert_eq!(
+                unescaped_underscores, 0,
+                "linea con `_` sin escapar: {line}"
+            );
         }
     }
 }

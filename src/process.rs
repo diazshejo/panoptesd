@@ -1,7 +1,7 @@
 //! Lectura manual de /proc/<pid>/stat y estado persistente por proceso.
 //!
-//! Se evita el crate `procfs` a proposito: aca solo necesitamos 4 campos
-//! (comm, utime, stime, rss en paginas) de un unico archivo por proceso,
+//! Se evita el crate `procfs`: se leen metricas e identidad de stat,
+//! y el enlace exe para aportar contexto sin confiar solo en comm,
 //! mas el uid (obtenido gratis via metadata del directorio /proc/<pid>,
 //! sin abrir ni parsear /proc/<pid>/status). Parsear a mano con buffers
 //! reutilizados evita allocaciones y lecturas de archivos que no usamos.
@@ -34,10 +34,15 @@ pub fn page_size() -> u64 {
 /// Snapshot crudo de un proceso leido en el tick actual. El pid no se
 /// guarda aca: quien llama a `read_process` ya lo tiene (es el argumento),
 /// asi que agregarlo como campo seria un dato redundante sin uso.
+#[derive(Clone, Debug)]
 pub struct ProcSample {
     pub comm: String,
     pub uid: u32,
     pub ppid: i32,
+    pub starttime: u64,
+    pub pgrp: i32,
+    pub flags: u64,
+    pub exe: Option<String>,
     pub utime: u64,
     pub stime: u64,
     pub rss_bytes: u64,
@@ -53,6 +58,15 @@ pub fn read_process(pid: i32, page_size: u64, buf: &mut String) -> Option<ProcSa
     let mut file = fs::File::open(&stat_path).ok()?;
     file.read_to_string(buf).ok()?;
 
+    let uid = fs::metadata(format!("/proc/{pid}")).ok()?.uid();
+    let mut sample = parse_stat(buf, uid, page_size)?;
+    sample.exe = fs::read_link(format!("/proc/{pid}/exe"))
+        .ok()
+        .map(|p| p.to_string_lossy().into_owned());
+    Some(sample)
+}
+
+fn parse_stat(buf: &str, uid: u32, page_size: u64) -> Option<ProcSample> {
     // comm puede contener espacios y parentesis, asi que se busca el
     // ultimo ')' para no confundir el parseo con el contenido del nombre.
     let last_paren = buf.rfind(')')?;
@@ -81,17 +95,17 @@ pub fn read_process(pid: i32, page_size: u64, buf: &mut String) -> Option<ProcSa
     let stime: u64 = fields[12].parse().ok()?;
     let rss_pages: u64 = fields[21].parse().ok()?;
 
-    // uid: metadata del propio directorio /proc/<pid> refleja el euid del
-    // proceso (evita parsear /proc/<pid>/status solo por esta linea).
-    let uid = fs::metadata(format!("/proc/{}", pid)).ok()?.uid();
-
     Some(ProcSample {
         comm,
         uid,
         ppid,
+        starttime: fields[19].parse().ok()?,
+        pgrp: fields[2].parse().ok()?,
+        flags: fields[6].parse().ok()?,
+        exe: None,
         utime,
         stime,
-        rss_bytes: rss_pages * page_size,
+        rss_bytes: rss_pages.checked_mul(page_size)?,
     })
 }
 
@@ -122,6 +136,11 @@ pub struct ProcessState {
     pub uid: u32,
     pub ppid: i32,
     pub username: String,
+    pub starttime: u64,
+    pub pgrp: i32,
+    pub flags: u64,
+    pub exe: Option<String>,
+    pub is_audit: bool,
     pub last_utime: u64,
     pub last_stime: u64,
     pub last_sample_at: Instant,
@@ -139,6 +158,11 @@ impl ProcessState {
             uid: sample.uid,
             ppid: sample.ppid,
             username,
+            starttime: sample.starttime,
+            pgrp: sample.pgrp,
+            flags: sample.flags,
+            exe: sample.exe.clone(),
+            is_audit: false,
             last_utime: sample.utime,
             last_stime: sample.stime,
             last_sample_at: now,
@@ -167,10 +191,70 @@ impl ProcessState {
         }
         self.uid = sample.uid;
         self.ppid = sample.ppid;
+        if self.pgrp != sample.pgrp {
+            self.is_audit = false;
+        }
+        self.pgrp = sample.pgrp;
+        self.flags = sample.flags;
+        self.exe.clone_from(&sample.exe);
         self.last_utime = sample.utime;
         self.last_stime = sample.stime;
         self.last_sample_at = now;
         self.rss_bytes = sample.rss_bytes;
         self.last_seen = now;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn stat_names_are_not_split_on_spaces_or_parentheses() {
+        for name in ["9", "https", "(sa1)", "(fwupdmgr)", "a ) tricky (x)"] {
+            // Campos 3..24, con valores distintos para detectar offsets erroneos.
+            let stat =
+                format!("42 ({name}) S 7 8 0 0 0 2097152 0 0 0 0 123 45 0 0 0 0 1 0 678 999 10\n");
+            let s = parse_stat(&stat, 1000, 4096).unwrap();
+            assert_eq!(s.comm, name);
+            assert_eq!((s.ppid, s.pgrp, s.starttime), (7, 8, 678));
+            assert_eq!(
+                (s.utime, s.stime, s.rss_bytes, s.flags),
+                (123, 45, 40960, 2097152)
+            );
+        }
+        assert!(parse_stat("42 (broken) S", 0, 4096).is_none());
+    }
+
+    #[test]
+    fn leaving_audit_group_revokes_exemption() {
+        let now = Instant::now();
+        let mut s = crate::test_support::state("sh", "/usr/bin/sh", 7, 123, now);
+        s.is_audit = true;
+        let sample = ProcSample {
+            comm: "sh".into(),
+            uid: 0,
+            ppid: 1,
+            starttime: 123,
+            pgrp: 99,
+            flags: 0,
+            exe: Some("/usr/bin/sh".into()),
+            utime: 0,
+            stime: 0,
+            rss_bytes: 4096,
+        };
+        s.update(&sample, now, 100);
+        assert!(!s.is_audit);
+        assert!(!ProcessState::new(&sample, "root".into(), now).is_audit);
+    }
+
+    #[test]
+    fn real_proc_name_matches_comm_and_executable() {
+        let pid = std::process::id() as i32;
+        let sample = read_process(pid, page_size(), &mut String::new()).unwrap();
+        let comm = fs::read_to_string(format!("/proc/{pid}/comm")).unwrap();
+        assert_eq!(sample.comm, comm.trim_end());
+        assert!(sample.exe.is_some());
+        assert!(sample.starttime > 0);
     }
 }

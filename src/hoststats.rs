@@ -51,6 +51,10 @@ fn read_proc_stat_cpu() -> Option<(u64, u64)> {
 /// (total_kb, disponible_kb) de /proc/meminfo.
 pub fn mem_total_available_kb() -> Option<(u64, u64)> {
     let content = fs::read_to_string("/proc/meminfo").ok()?;
+    parse_meminfo(&content)
+}
+
+fn parse_meminfo(content: &str) -> Option<(u64, u64)> {
     let mut total = None;
     let mut available = None;
     for line in content.lines() {
@@ -60,11 +64,12 @@ pub fn mem_total_available_kb() -> Option<(u64, u64)> {
             available = parse_kb_field(rest);
         }
     }
-    Some((total?, available?))
+    let (total, available) = (total?, available?);
+    (total > 0 && available <= total).then_some((total, available))
 }
 
 fn parse_kb_field(s: &str) -> Option<u64> {
-    s.trim().split_whitespace().next()?.parse().ok()
+    s.split_whitespace().next()?.parse().ok()
 }
 
 pub struct DiskUsage {
@@ -102,4 +107,20 @@ pub fn format_uptime(secs: u64) -> String {
     let hours = (secs % 86400) / 3600;
     let minutes = (secs % 3600) / 60;
     format!("{days}d {hours}h {minutes}m")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn uses_available_not_free_and_rejects_missing_metrics() {
+        assert_eq!(
+            parse_meminfo(
+                "MemTotal: 2000 kB\nMemFree: 1 kB\nMemAvailable: 900 kB\nSwapFree: 123 kB"
+            ),
+            Some((2000, 900))
+        );
+        assert_eq!(parse_meminfo("MemTotal: 2000 kB\nMemFree: 1 kB"), None);
+        assert_eq!(parse_meminfo("MemTotal: 2 kB\nMemAvailable: 3 kB"), None);
+    }
 }

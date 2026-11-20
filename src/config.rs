@@ -20,13 +20,16 @@ pub struct Config {
     /// Ruta del script bash de auditoria a ejecutar ante una anomalia.
     pub audit_script_path: String,
 
-    /// Cooldown (segundos) para no repetir el mismo disparo del mismo
-    /// PID + tipo de anomalia en un periodo corto.
+    /// Cooldown desde entrega confirmada: por instancia+tipo, grupo root
+    /// o memoria del host. No se consume ante fallos de cola/envio.
     pub cooldown_secs: u64,
 
     /// Cantidad de hilos del pool que ejecutan el script de auditoria.
     #[serde(default = "default_worker_threads")]
     pub script_worker_threads: usize,
+
+    #[serde(default = "default_audit_timeout")]
+    pub audit_timeout_secs: u64,
 
     pub rules: RulesConfig,
 
@@ -38,6 +41,10 @@ pub struct Config {
 
     #[serde(default)]
     pub ssh_watch: SshWatchConfig,
+}
+
+fn default_audit_timeout() -> u64 {
+    30
 }
 
 fn default_log_level() -> String {
@@ -52,6 +59,8 @@ fn default_worker_threads() -> usize {
 pub struct RulesConfig {
     pub cpu: CpuRuleConfig,
     pub memory: MemoryRuleConfig,
+    #[serde(default)]
+    pub host_memory: HostMemoryConfig,
     pub root_whitelist: RootWhitelistConfig,
     pub ephemeral: EphemeralRuleConfig,
 }
@@ -77,11 +86,34 @@ pub struct MemoryRuleConfig {
 }
 
 #[derive(Debug, Deserialize, Clone)]
+#[serde(default)]
+pub struct HostMemoryConfig {
+    pub enabled: bool,
+    pub min_available_mb: u64,
+    pub min_available_percent: f64,
+    pub sustained_secs: u64,
+}
+
+impl Default for HostMemoryConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            min_available_mb: 256,
+            min_available_percent: 15.0,
+            sustained_secs: 10,
+        }
+    }
+}
+
+#[derive(Debug, Deserialize, Clone)]
 pub struct RootWhitelistConfig {
     pub enabled: bool,
     /// Nombres de proceso (comm, tal como aparece en /proc/<pid>/stat)
     /// permitidos para correr como root sin generar alerta.
     pub allowed_names: Vec<String>,
+    /// Ventana para agrupar eventos relacionados; no es una whitelist.
+    #[serde(default = "default_group_window")]
+    pub group_window_secs: u64,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -127,6 +159,10 @@ impl Default for NetworkConfig {
             allowed_listen_ports: Vec::new(),
         }
     }
+}
+
+fn default_group_window() -> u64 {
+    10
 }
 
 fn default_network_every() -> u64 {
@@ -242,11 +278,91 @@ fn default_ssh_unit() -> String {
 }
 
 impl Config {
+    pub fn validate(&self) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            self.poll_interval_secs > 0,
+            "poll_interval_secs debe ser > 0"
+        );
+        anyhow::ensure!(
+            self.script_worker_threads > 0 && self.script_worker_threads <= 32,
+            "script_worker_threads debe ser 1..32"
+        );
+        anyhow::ensure!(
+            self.audit_timeout_secs > 0,
+            "audit_timeout_secs debe ser > 0"
+        );
+        anyhow::ensure!(
+            self.network.check_every_n_cycles > 0,
+            "check_every_n_cycles debe ser > 0"
+        );
+        anyhow::ensure!(
+            self.telegram.request_timeout_secs > 0,
+            "request_timeout_secs debe ser > 0"
+        );
+        anyhow::ensure!(
+            self.rules.memory.max_rss_mb > 0 && self.rules.memory.max_rss_mb <= u64::MAX / 1048576,
+            "max_rss_mb fuera de rango"
+        );
+        let h = &self.rules.host_memory;
+        anyhow::ensure!(
+            h.min_available_percent.is_finite() && (0.0..100.0).contains(&h.min_available_percent),
+            "min_available_percent debe estar en [0, 100)"
+        );
+        anyhow::ensure!(
+            h.min_available_mb <= u64::MAX / 1024,
+            "min_available_mb fuera de rango"
+        );
+        anyhow::ensure!(
+            !h.enabled || h.min_available_mb > 0 || h.min_available_percent > 0.0,
+            "host_memory requiere un umbral positivo"
+        );
+        Ok(())
+    }
+
     pub fn load(path: &Path) -> anyhow::Result<Config> {
         let raw = fs::read_to_string(path)
             .map_err(|e| anyhow::anyhow!("no se pudo leer config {:?}: {}", path, e))?;
         let cfg: Config = toml::from_str(&raw)
             .map_err(|e| anyhow::anyhow!("config TOML invalida en {:?}: {}", path, e))?;
+        cfg.validate()?;
         Ok(cfg)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn example_and_old_config_load_with_host_protection() {
+        let cfg = crate::test_support::config();
+        cfg.validate().unwrap();
+        let old = include_str!("../config/config.example.toml");
+        let mut value: toml::Value = toml::from_str(old).unwrap();
+        value["rules"].as_table_mut().unwrap().remove("host_memory");
+        let old: Config = value.try_into().unwrap();
+        assert!(old.rules.host_memory.enabled);
+        old.validate().unwrap();
+    }
+    #[test]
+    fn rejects_invalid_thresholds_and_intervals() {
+        let cfg = crate::test_support::config();
+        let mut c = cfg.clone();
+        c.poll_interval_secs = 0;
+        assert!(c.validate().is_err());
+        let mut c = cfg.clone();
+        c.network.check_every_n_cycles = 0;
+        assert!(c.validate().is_err());
+        let mut c = cfg.clone();
+        c.rules.memory.max_rss_mb = u64::MAX;
+        assert!(c.validate().is_err());
+        let mut c = cfg.clone();
+        c.rules.host_memory.min_available_percent = f64::NAN;
+        assert!(c.validate().is_err());
+        let mut c = cfg.clone();
+        c.rules.host_memory.min_available_percent = 100.0;
+        assert!(c.validate().is_err());
+        let mut c = cfg;
+        c.audit_timeout_secs = 0;
+        assert!(c.validate().is_err());
     }
 }

@@ -4,11 +4,14 @@ mod hoststats;
 mod logging;
 mod network;
 mod process;
+mod root_events;
 mod rules;
 mod scheduler;
 mod signals;
 mod ssh_watch;
 mod telegram;
+#[cfg(test)]
+mod test_support;
 mod timefmt;
 mod trigger;
 mod userdb;
@@ -21,11 +24,10 @@ use std::collections::hash_map::Entry;
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::mpsc::SyncSender;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use telegram::TelegramClient;
-use trigger::{CooldownTracker, TriggerJob};
+use trigger::{AuditGroups, CooldownTracker, EventKey, EventSender, TriggerJob};
 use userdb::UserDb;
 
 /// Cada cuantos ciclos se hace la limpieza de cooldowns vencidos. No hace
@@ -118,15 +120,13 @@ fn telegram_client_from_env(config: &Config) -> Result<Option<TelegramClient>, S
     Ok(Some(TelegramClient::new(token, chat_id, timeout)))
 }
 
-/// Version para el daemon: si faltan credenciales se loguea el error y
-/// Telegram queda deshabilitado para toda la corrida. Nunca es motivo para
-/// no arrancar.
-fn build_telegram_client(config: &Config) -> Option<Arc<TelegramClient>> {
+/// Si Telegram esta requerido pero faltan credenciales, fallar al iniciar
+/// en vez de operar inadvertidamente sin notificaciones.
+fn build_telegram_client(config: &Config) -> anyhow::Result<Option<Arc<TelegramClient>>> {
     match telegram_client_from_env(config) {
-        Ok(client) => client.map(Arc::new),
+        Ok(client) => Ok(client.map(Arc::new)),
         Err(e) => {
-            tracing::error!("{e}; Telegram queda deshabilitado para esta corrida");
-            None
+            anyhow::bail!("{e}; no se inicia con notificaciones requeridas sin credenciales")
         }
     }
 }
@@ -187,18 +187,38 @@ fn main() -> anyhow::Result<()> {
     let shutdown = signals::setup_shutdown_flag();
     let history = Arc::new(AuditHistory::new());
     let watched_count = Arc::new(AtomicUsize::new(0));
-    let telegram_client = build_telegram_client(&config);
+    let telegram_client = build_telegram_client(&config)?;
+    let cooldowns = CooldownTracker::new(Duration::from_secs(config.cooldown_secs));
+    let audit_groups: AuditGroups = Arc::new(Mutex::new(HashSet::new()));
+    tracing::info!(poll_secs = config.poll_interval_secs, cooldown_secs = config.cooldown_secs,
+        rss_mb = config.rules.memory.max_rss_mb, host_memory = ?config.rules.host_memory,
+        "configuracion efectiva de memoria");
+    if let Some((total, available)) = hoststats::mem_total_available_kb() {
+        tracing::info!(
+            total_kib = total,
+            available_kib = available,
+            "memoria al iniciar"
+        );
+        if config.rules.memory.enabled && config.rules.memory.max_rss_mb >= total / 1024 {
+            tracing::warn!("umbral RSS >= RAM del host; no protege contra OOM del host ni cgroup");
+        }
+    }
 
     let (tx, worker_handles) = trigger::spawn_worker_pool(
         config.audit_script_path.clone(),
         config.script_worker_threads,
         telegram_client.clone(),
         Arc::clone(&history),
+        cooldowns.clone(),
+        audit_groups.clone(),
+        Duration::from_secs(config.audit_timeout_secs),
     );
 
     let mut scheduler_handles = Vec::new();
     if let Some(client) = &telegram_client {
-        tracing::info!("integracion con Telegram habilitada: status periodico y resumen semanal activos");
+        tracing::info!(
+            "integracion con Telegram habilitada: status periodico y resumen semanal activos"
+        );
         scheduler_handles.push(scheduler::spawn_status_scheduler(
             Arc::clone(&config),
             Arc::clone(&shutdown),
@@ -212,7 +232,7 @@ fn main() -> anyhow::Result<()> {
             Arc::clone(&shutdown),
             Arc::clone(client),
             Arc::clone(&history),
-            tx.clone(),
+            tx.normal.clone(),
         ));
     }
 
@@ -220,12 +240,23 @@ fn main() -> anyhow::Result<()> {
     // journal de sshd y no pasa por reglas ni cooldown.
     let ssh_watch_handle = if config.ssh_watch.enabled {
         tracing::info!(unit = %config.ssh_watch.unit_name, "monitoreo de logins SSH habilitado");
-        Some(ssh_watch::spawn(Arc::clone(&config), Arc::clone(&shutdown), telegram_client.clone()))
+        Some(ssh_watch::spawn(
+            Arc::clone(&config),
+            Arc::clone(&shutdown),
+            telegram_client.clone(),
+        ))
     } else {
         None
     };
 
-    run_loop(&config, &shutdown, &tx, &watched_count);
+    run_loop(
+        &config,
+        &shutdown,
+        &tx,
+        &watched_count,
+        cooldowns,
+        &audit_groups,
+    );
 
     tracing::info!("señal de apagado recibida, cerrando cola de auditoria y esperando workers");
     drop(tx);
@@ -245,16 +276,18 @@ fn main() -> anyhow::Result<()> {
 fn run_loop(
     config: &Config,
     shutdown: &std::sync::atomic::AtomicBool,
-    tx: &SyncSender<TriggerJob>,
+    tx: &EventSender,
     watched_count: &AtomicUsize,
+    mut cooldowns: CooldownTracker,
+    audit_groups: &AuditGroups,
 ) {
     let ticks_per_sec = process::clock_ticks_per_sec();
     let page_size = process::page_size();
     let poll_interval = Duration::from_secs(config.poll_interval_secs);
-    let cooldown = Duration::from_secs(config.cooldown_secs);
 
     let mut states: HashMap<i32, ProcessState> = HashMap::new();
-    let mut cooldowns = CooldownTracker::new(cooldown);
+    let mut host_memory = rules::HostMemoryTracker::default();
+    let mut root_batches = root_events::RootBatches::default();
     let mut userdb = UserDb::load();
     // Linea de base de puertos LISTEN: None hasta el primer chequeo de red
     // (asi el primer ciclo solo releva lo que ya estaba escuchando al
@@ -278,10 +311,14 @@ fn run_loop(
         seen_pids.clear();
 
         for &pid in pid_buf.iter() {
+            // Coordinar lectura y registro con spawn/cleanup del worker.
+            let audit_registry = audit_groups.lock().unwrap();
             let sample = match process::read_process(pid, page_size, &mut stat_buf) {
                 Some(s) => s,
                 None => continue, // proceso desaparecio entre el listado y la lectura
             };
+            let is_audit = audit_registry.contains(&sample.pgrp);
+            drop(audit_registry);
             seen_pids.insert(pid);
 
             let now = Instant::now();
@@ -290,6 +327,9 @@ fn run_loop(
             // mismo mapa no compila de forma directa).
             let state: &mut ProcessState = match states.entry(pid) {
                 Entry::Occupied(mut occ) => {
+                    if occ.get().starttime != sample.starttime {
+                        occ.insert(ProcessState::new(&sample, userdb.lookup(sample.uid), now));
+                    }
                     let uid_changed = occ.get().uid != sample.uid;
                     occ.get_mut().update(&sample, now, ticks_per_sec);
                     if uid_changed {
@@ -303,10 +343,57 @@ fn run_loop(
                 }
             };
 
+            // Conservar procedencia para auxiliares ya finalizados/zombies.
+            // update la revoca si abandonan el grupo; un PID nuevo empieza limpio.
+            state.is_audit |= is_audit;
+        }
+
+        // Evaluar despues de recolectar: contexto de ancestros independiente
+        // del orden en que readdir devuelve los PIDs.
+        let root_contexts: HashMap<_, _> = seen_pids
+            .iter()
+            .map(|&pid| (pid, root_events::context(pid, &states)))
+            .collect();
+        for &pid in &seen_pids {
+            let now = Instant::now();
+            let state = states.get_mut(&pid).unwrap();
             let events = rules::evaluate(config, pid, state, now);
             for event in events {
-                dispatch(tx, &mut cooldowns, pid, state, event, now);
+                if event.kind == AnomalyKind::RootNotWhitelisted {
+                    root_batches.observe(root_contexts[&pid].clone(), pid, state, now);
+                } else {
+                    dispatch(tx, &mut cooldowns, pid, state, event, now);
+                }
             }
+        }
+
+        root_batches.flush(
+            Duration::from_secs(config.rules.root_whitelist.group_window_secs),
+            Instant::now(),
+            tx,
+            &cooldowns,
+        );
+        let memory_sample = hoststats::mem_total_available_kb();
+        if memory_sample.is_none() {
+            tracing::warn!("no se pudo leer MemAvailable/MemTotal");
+        }
+        if let Some(event) =
+            host_memory.evaluate(&config.rules.host_memory, memory_sample, Instant::now())
+        {
+            tx.enqueue(
+                TriggerJob {
+                    pid: 0,
+                    name: "host".into(),
+                    user: "system".into(),
+                    kind: event.kind,
+                    detail: event.detail,
+                    run_audit: true,
+                    key: None,
+                },
+                EventKey::HostMemory,
+                &cooldowns,
+                Instant::now(),
+            );
         }
 
         // Procesos que estaban trackeados y ya no aparecen en /proc: se
@@ -323,7 +410,14 @@ fn run_loop(
         });
 
         if config.network.enabled && cycle.is_multiple_of(config.network.check_every_n_cycles) {
-            check_network(config, &states, &pid_buf, tx, &mut cooldowns, &mut listen_baseline);
+            check_network(
+                config,
+                &states,
+                &pid_buf,
+                tx,
+                &mut cooldowns,
+                &mut listen_baseline,
+            );
         }
 
         if cycle.is_multiple_of(COOLDOWN_SWEEP_EVERY_CYCLES) {
@@ -339,26 +433,24 @@ fn run_loop(
 }
 
 fn dispatch(
-    tx: &SyncSender<TriggerJob>,
+    tx: &EventSender,
     cooldowns: &mut CooldownTracker,
     pid: i32,
     state: &ProcessState,
     event: rules::AnomalyEvent,
     now: Instant,
 ) {
-    if !cooldowns.should_fire(pid, event.kind, now) {
-        return;
-    }
+    let key = EventKey::Process(pid, state.starttime, event.kind);
     let job = TriggerJob {
         pid,
         name: state.comm.clone(),
         user: state.username.clone(),
         kind: event.kind,
         detail: event.detail,
+        run_audit: !state.is_audit,
+        key: None,
     };
-    if let Err(e) = tx.try_send(job) {
-        tracing::warn!(pid, error = %e, "cola de auditoria llena, evento descartado");
-    }
+    tx.enqueue(job, key, cooldowns, now);
 }
 
 /// Orquesta las dos reglas de red, ambas gateadas por el mismo
@@ -369,7 +461,7 @@ fn check_network(
     config: &Config,
     states: &HashMap<i32, ProcessState>,
     pids: &[i32],
-    tx: &SyncSender<TriggerJob>,
+    tx: &EventSender,
     cooldowns: &mut CooldownTracker,
     listen_baseline: &mut Option<HashSet<(i32, u16, network::Protocol)>>,
 ) {
@@ -389,8 +481,23 @@ fn check_network(
         .map(|s| s.local_port)
         .collect();
 
-    check_unexpected_outbound(config, states, &inode_to_pid, &tcp_listen_ports, tx, cooldowns);
-    check_new_listen_ports(config, states, &inode_to_pid, &listen_sockets, tx, cooldowns, listen_baseline);
+    check_unexpected_outbound(
+        config,
+        states,
+        &inode_to_pid,
+        &tcp_listen_ports,
+        tx,
+        cooldowns,
+    );
+    check_new_listen_ports(
+        config,
+        states,
+        &inode_to_pid,
+        &listen_sockets,
+        tx,
+        cooldowns,
+        listen_baseline,
+    );
 }
 
 /// Regla `conexion_saliente_no_esperada`: conexiones TCP ESTABLISHED
@@ -409,7 +516,7 @@ fn check_unexpected_outbound(
     states: &HashMap<i32, ProcessState>,
     inode_to_pid: &HashMap<u64, i32>,
     tcp_listen_ports: &HashSet<u16>,
-    tx: &SyncSender<TriggerJob>,
+    tx: &EventSender,
     cooldowns: &mut CooldownTracker,
 ) {
     let connections = network::parse_tcp_connections("/proc/net/tcp");
@@ -419,10 +526,19 @@ fn check_unexpected_outbound(
     let ephemeral = network::local_port_range();
 
     for conn in &connections {
-        if network::is_inbound(conn, &config.network.allowed_listen_ports, tcp_listen_ports, ephemeral) {
+        if network::is_inbound(
+            conn,
+            &config.network.allowed_listen_ports,
+            tcp_listen_ports,
+            ephemeral,
+        ) {
             continue;
         }
-        if network::is_allowed(conn, &config.network.allowed_remote_ports, &config.network.allowed_cidrs_v4) {
+        if network::is_allowed(
+            conn,
+            &config.network.allowed_remote_ports,
+            &config.network.allowed_cidrs_v4,
+        ) {
             continue;
         }
         let pid = match inode_to_pid.get(&conn.inode) {
@@ -456,11 +572,12 @@ fn check_new_listen_ports(
     states: &HashMap<i32, ProcessState>,
     inode_to_pid: &HashMap<u64, i32>,
     sockets: &[network::ListenSocket],
-    tx: &SyncSender<TriggerJob>,
+    tx: &EventSender,
     cooldowns: &mut CooldownTracker,
     baseline: &mut Option<HashSet<(i32, u16, network::Protocol)>>,
 ) {
-    let mut current: HashMap<(i32, u16, network::Protocol), &network::ListenSocket> = HashMap::new();
+    let mut current: HashMap<(i32, u16, network::Protocol), &network::ListenSocket> =
+        HashMap::new();
     for sock in sockets {
         if let Some(&pid) = inode_to_pid.get(&sock.inode) {
             current.insert((pid, sock.local_port, sock.protocol), sock);
@@ -491,7 +608,12 @@ fn check_new_listen_ports(
         let now = Instant::now();
         let event = rules::AnomalyEvent {
             kind: AnomalyKind::NewListenPort,
-            detail: format!("{} escuchando en {}:{} (nuevo)", protocol.as_str(), sock.local_ip, port),
+            detail: format!(
+                "{} escuchando en {}:{} (nuevo)",
+                protocol.as_str(),
+                sock.local_ip,
+                port
+            ),
         };
         dispatch(tx, cooldowns, pid, state, event, now);
     }

@@ -7,6 +7,23 @@ y este proyecto adhiere a [Semantic Versioning](https://semver.org/lang/es/).
 
 ## [Unreleased]
 
+### Revision de alertas y memoria (2026-09-28)
+
+- Deteccion sostenida de MemAvailable del host, umbrales configurables y
+  validacion de configuracion; ejemplo RSS reducido a 768 MiB para ajustar
+  antes del despliegue y advertencia de RSS >= RAM al iniciar.
+- Agrupacion de root por contexto de ejecutable y ancestros, sin ampliar
+  whitelist; evidencia individual en log y repeticion tras cooldown.
+- Auditorias identificadas por grupo creado por el daemon, sin recursion,
+  con timeout y conservando deteccion de CPU/RSS/red en sus procesos.
+- Notificaciones de memoria separadas de root y de ejecucion de scripts;
+  cooldown solo tras entrega confirmada, reintentos y errores sin token.
+- Identidad PID+starttime y filtro PF_KTHREAD: exe borrado/inaccesible ya
+  no excluye procesos de usuario de la regla root.
+- Capturas de memoria/swap/OOM/cgroup en auditoria, pruebas de regresion e
+  informe que distingue evidencia disponible del incidente no confirmado.
+
+
 ### Added
 
 - Notificaciones por Telegram (`ureq`, sin runtime async), opcionales

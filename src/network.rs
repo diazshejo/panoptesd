@@ -32,7 +32,10 @@ pub struct EphemeralRange {
 
 impl EphemeralRange {
     /// Default de Linux (net.ipv4.ip_local_port_range = 32768 60999).
-    pub const LINUX_DEFAULT: EphemeralRange = EphemeralRange { low: 32768, high: 60999 };
+    pub const LINUX_DEFAULT: EphemeralRange = EphemeralRange {
+        low: 32768,
+        high: 60999,
+    };
 
     pub fn contains(&self, port: u16) -> bool {
         port >= self.low && port <= self.high
@@ -193,7 +196,12 @@ fn parse_hex_ipv6_port(s: &str) -> Option<(Ipv6Addr, u16)> {
 /// escucha real (es sin conexion), asi que se usa la misma convencion que
 /// `ss -l`: estado 07 (UNCONN) = socket bindeado a un puerto local
 /// esperando datagramas, el equivalente practico a "escuchando".
-fn parse_listen_sockets(path: &str, protocol: Protocol, listen_state: &str, is_v6: bool) -> Vec<ListenSocket> {
+fn parse_listen_sockets(
+    path: &str,
+    protocol: Protocol,
+    listen_state: &str,
+    is_v6: bool,
+) -> Vec<ListenSocket> {
     let content = match fs::read_to_string(path) {
         Ok(c) => c,
         Err(_) => return Vec::new(),
@@ -263,9 +271,7 @@ pub fn build_inode_to_pid(pids: &[i32]) -> HashMap<u64, i32> {
 
 fn parse_socket_inode(link_target: &str) -> Option<u64> {
     // formato: "socket:[12345]"
-    let inner = link_target
-        .strip_prefix("socket:[")?
-        .strip_suffix(']')?;
+    let inner = link_target.strip_prefix("socket:[")?.strip_suffix(']')?;
     inner.parse::<u64>().ok()
 }
 
@@ -363,7 +369,10 @@ mod tests {
 
     #[test]
     fn rango_efimero_respeta_la_config_del_kernel() {
-        let custom = EphemeralRange { low: 10000, high: 65000 };
+        let custom = EphemeralRange {
+            low: 10000,
+            high: 65000,
+        };
         let listening = HashSet::new();
         assert!(!is_inbound(&conn(10773, 443), &[], &listening, custom));
         assert!(is_inbound(&conn(10773, 443), &[], &listening, EPH));
@@ -373,9 +382,18 @@ mod tests {
     fn parse_ip_local_port_range() {
         assert_eq!(
             parse_local_port_range("32768\t60999\n"),
-            Some(EphemeralRange { low: 32768, high: 60999 })
+            Some(EphemeralRange {
+                low: 32768,
+                high: 60999
+            })
         );
-        assert_eq!(parse_local_port_range("1024 65535"), Some(EphemeralRange { low: 1024, high: 65535 }));
+        assert_eq!(
+            parse_local_port_range("1024 65535"),
+            Some(EphemeralRange {
+                low: 1024,
+                high: 65535
+            })
+        );
         assert_eq!(parse_local_port_range("60999 32768"), None);
         assert_eq!(parse_local_port_range(""), None);
         assert_eq!(parse_local_port_range("abc def"), None);

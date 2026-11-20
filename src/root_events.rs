@@ -1,0 +1,227 @@
+//! Agrupacion temporal de root: nunca autoriza nombres ni descarta integrantes.
+use crate::process::ProcessState;
+use crate::rules::AnomalyKind;
+use crate::trigger::{CooldownTracker, EventKey, EventSender, TriggerJob};
+use std::collections::HashMap;
+use std::os::unix::fs::MetadataExt;
+use std::time::{Duration, Instant};
+
+const PACKAGE_EXES: &[&str] = &[
+    "/usr/bin/apt",
+    "/usr/bin/apt-get",
+    "/usr/bin/dpkg",
+    "/usr/libexec/packagekitd",
+    "/usr/lib/packagekit/packagekitd",
+];
+
+fn trusted_package_exe(exe: &str) -> bool {
+    if !PACKAGE_EXES.contains(&exe) {
+        return false;
+    }
+    // Verificar ejecutable Y directorios: no confiar en comm ni argv[0].
+    std::path::Path::new(exe)
+        .ancestors()
+        .all(|path| std::fs::metadata(path).is_ok_and(|m| m.uid() == 0 && m.mode() & 0o022 == 0))
+}
+
+pub fn context(pid: i32, states: &HashMap<i32, ProcessState>) -> String {
+    context_with(pid, states, trusted_package_exe)
+}
+
+fn context_with(
+    pid: i32,
+    states: &HashMap<i32, ProcessState>,
+    trusted: impl Fn(&str) -> bool,
+) -> String {
+    let origin = &states[&pid];
+    let mut current_pid = pid;
+    let mut package = None;
+    // Ancestro de paquetes mas alto observado en este snapshot. El limite
+    // tambien evita ciclos por una lectura concurrente de /proc.
+    for _ in 0..64 {
+        let Some(state) = states.get(&current_pid) else {
+            break;
+        };
+        if state.uid == 0 && state.exe.as_deref().is_some_and(&trusted) {
+            package = Some(format!(
+                "paquetes:{}:{}:{}",
+                current_pid,
+                state.starttime,
+                state.exe.as_deref().unwrap()
+            ));
+        }
+        if state.ppid <= 1 || state.ppid == current_pid {
+            break;
+        }
+        let Some(parent) = states.get(&state.ppid) else {
+            break;
+        };
+        if parent.starttime > state.starttime {
+            break;
+        }
+        current_pid = state.ppid;
+    }
+    package.unwrap_or_else(|| {
+        // Identidad conservadora: mismo ejecutable/comm y misma instancia
+        // del padre agrupan auxiliares repetidos, no todos los shells del host.
+        let parent_start = states.get(&origin.ppid).map(|p| p.starttime);
+        match (&origin.exe, parent_start) {
+            (Some(exe), Some(start)) => format!(
+                "exe:{exe:?}:comm:{:?}:padre:{}:{start}",
+                origin.comm, origin.ppid
+            ),
+            _ => format!("proceso:{pid}:{}", origin.starttime),
+        }
+    })
+}
+
+struct Batch {
+    since: Instant,
+    members: HashMap<(i32, u64), String>,
+    extra_observations: u64,
+    representative: TriggerJob,
+}
+
+#[derive(Default)]
+pub struct RootBatches {
+    batches: HashMap<String, Batch>,
+}
+
+impl RootBatches {
+    pub fn observe(&mut self, context: String, pid: i32, state: &ProcessState, now: Instant) {
+        // Acotar memoria aun durante una caida prolongada de Telegram.
+        // La saturacion se reporta como grupo y cada miembro queda en log.
+        let context = if self.batches.len() >= 512 && !self.batches.contains_key(&context) {
+            tracing::error!(
+                context,
+                "agrupacion root saturada; usando resumen de desborde"
+            );
+            "desborde-root: consultar log de integrantes".to_string()
+        } else {
+            context
+        };
+        let batch = self.batches.entry(context).or_insert_with(|| Batch {
+            since: now,
+            members: HashMap::new(),
+            extra_observations: 0,
+            representative: TriggerJob {
+                pid,
+                name: state.comm.clone(),
+                user: state.username.clone(),
+                kind: AnomalyKind::RootNotWhitelisted,
+                detail: String::new(),
+                run_audit: !state.is_audit,
+                key: None,
+            },
+        });
+        let identity = (pid, state.starttime);
+        if batch.members.contains_key(&identity) {
+            return;
+        }
+        let detail = format!(
+            "pid={pid} start={} comm={:?} exe={:?} ppid={}",
+            state.starttime, state.comm, state.exe, state.ppid
+        );
+        tracing::warn!(detail, "root fuera de whitelist: integrante de grupo");
+        if batch.members.len() < 128 {
+            batch.members.insert(identity, detail);
+        } else {
+            batch.extra_observations += 1;
+        }
+    }
+
+    pub fn flush(
+        &mut self,
+        window: Duration,
+        now: Instant,
+        tx: &EventSender,
+        cooldowns: &CooldownTracker,
+    ) {
+        self.batches.retain(|context, batch| {
+            if now.duration_since(batch.since) < window { return true; }
+            let mut members: Vec<_> = batch.members.values().collect();
+            members.sort();
+            let examples: Vec<_> = members.iter().take(8).map(|s| s.chars().take(220).collect::<String>()).collect();
+            let mut job = batch.representative.clone();
+            let context_display: String = context.chars().take(200).collect();
+            job.detail = format!("Grupo root ({context_display}): {} procesos; {} observaciones adicionales. Muestra: {}. Integrantes completos en journal/log.",
+                members.len(), batch.extra_observations, examples.join("; "));
+            !tx.enqueue(job, EventKey::Root(context.clone()), cooldowns, now)
+        });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::rules;
+    use crate::test_support::{config, state};
+    use crate::trigger::test_channels;
+
+    #[test]
+    fn package_update_groups_helpers_without_authorizing_generic_names() {
+        let now = Instant::now();
+        let mut states = HashMap::from([
+            (100, state("apt-get", "/usr/bin/apt-get", 1, 10, now)),
+            (101, state("dpkg", "/usr/bin/dpkg", 100, 11, now)),
+            (102, state("sh", "/usr/bin/dash", 101, 12, now)),
+            (
+                103,
+                state("https", "/usr/lib/apt/methods/https", 100, 13, now),
+            ),
+            (104, state("python3", "/usr/bin/python3", 102, 14, now)),
+            (200, state("sh", "/tmp/sh", 1, 15, now)),
+            (201, state("apt-get", "/tmp/apt-get", 1, 16, now)),
+        ]);
+        let context = |pid| context_with(pid, &states, |e| PACKAGE_EXES.contains(&e));
+        for pid in 101..=104 {
+            assert_eq!(context(pid), context(100));
+        }
+        assert_ne!(context(200), context(100));
+        assert_ne!(context(201), context(100));
+        assert_ne!(context_with(100, &states, |_| false), context(100)); // ejecutable no confiable
+        let group = context(100);
+        let mut batches = RootBatches::default();
+        for pid in 100..=104 {
+            let s = states.get_mut(&pid).unwrap();
+            assert!(rules::evaluate(&config(), pid, s, now)
+                .iter()
+                .any(|e| e.kind == AnomalyKind::RootNotWhitelisted));
+            batches.observe(group.clone(), pid, s, now);
+        }
+        batches.observe("unexpected".into(), 200, &states[&200], now);
+        let (tx, rx, _) = test_channels(8);
+        let cooldowns = CooldownTracker::new(Duration::from_secs(300));
+        batches.flush(Duration::from_secs(10), now, &tx, &cooldowns);
+        assert!(rx.try_recv().is_err());
+        batches.flush(
+            Duration::from_secs(10),
+            now + Duration::from_secs(10),
+            &tx,
+            &cooldowns,
+        );
+        let jobs = [rx.try_recv().unwrap(), rx.try_recv().unwrap()];
+        assert!(jobs.iter().any(|j| j.detail.contains("5 procesos")));
+        assert!(jobs.iter().any(|j| j.pid == 200));
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn root_repeats_after_cooldown_and_short_lived_members_are_retained() {
+        let t = Instant::now();
+        let s = state("unexpected", "/tmp/unexpected", 1, 42, t);
+        let mut batches = RootBatches::default();
+        let (tx, rx, _) = test_channels(8);
+        let cooldowns = CooldownTracker::new(Duration::from_secs(30));
+        batches.observe("unexpected".into(), 500, &s, t);
+        batches.flush(Duration::ZERO, t, &tx, &cooldowns);
+        let job = rx.try_recv().unwrap();
+        cooldowns.finish(job.key.as_ref().unwrap(), true, t);
+        batches.observe("unexpected".into(), 501, &s, t + Duration::from_secs(1));
+        batches.flush(Duration::ZERO, t + Duration::from_secs(29), &tx, &cooldowns);
+        assert!(rx.try_recv().is_err());
+        // Aunque PID 501 ya no se observe, no se descarta su evidencia.
+        batches.flush(Duration::ZERO, t + Duration::from_secs(30), &tx, &cooldowns);
+        assert!(rx.try_recv().unwrap().detail.contains("pid=501"));
+    }
+}

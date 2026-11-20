@@ -13,6 +13,7 @@ path = "src/main.rs"
 # Configuracion
 serde = { version = "1", features = ["derive"] }
 toml = "0.8"
+serde_json = "1"
 
 # Manejo de errores de arranque (config invalida, script inexistente, etc).
 # Crate minimalista, sin macros proc pesadas ni dependencias transitivas

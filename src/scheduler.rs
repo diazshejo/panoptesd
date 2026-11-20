@@ -131,8 +131,15 @@ fn seconds_until_next_weekly(config: &Config) -> u64 {
     target_unix.saturating_sub(now).max(1)
 }
 
-fn run_weekly(telegram: &TelegramClient, history: &AuditHistory, tx: &SyncSender<TriggerJob>, shutdown: &AtomicBool) {
+fn run_weekly(
+    telegram: &TelegramClient,
+    history: &AuditHistory,
+    tx: &SyncSender<TriggerJob>,
+    shutdown: &AtomicBool,
+) {
     let job = TriggerJob {
+        run_audit: true,
+        key: None,
         pid: 0,
         name: "system".to_string(),
         user: "system".to_string(),
@@ -155,7 +162,11 @@ fn run_weekly(telegram: &TelegramClient, history: &AuditHistory, tx: &SyncSender
     let now = timefmt::unix_now();
     let week_ago = now.saturating_sub(7 * 24 * 3600);
     let records = history.since(week_ago);
-    let text = telegram::format_weekly_summary(&records, &timefmt::format_utc(week_ago), &timefmt::format_utc(now));
+    let text = telegram::format_weekly_summary(
+        &records,
+        &timefmt::format_utc(week_ago),
+        &timefmt::format_utc(now),
+    );
 
     if let Err(e) = telegram.send(&text) {
         tracing::error!(error = %e, "no se pudo enviar el resumen semanal a Telegram");

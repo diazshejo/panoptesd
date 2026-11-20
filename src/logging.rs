@@ -12,12 +12,9 @@ pub struct LoggingGuards {
 }
 
 pub fn init(config: &Config) -> LoggingGuards {
-    let filter = EnvFilter::try_new(&config.log_level)
-        .unwrap_or_else(|_| EnvFilter::new("info"));
+    let filter = EnvFilter::try_new(&config.log_level).unwrap_or_else(|_| EnvFilter::new("info"));
 
-    let stdout_layer = fmt::layer()
-        .with_target(false)
-        .with_writer(std::io::stdout);
+    let stdout_layer = fmt::layer().with_target(false).with_writer(std::io::stdout);
 
     let (file_layer, guard) = match &config.log_file {
         Some(path) => {

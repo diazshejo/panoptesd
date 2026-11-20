@@ -12,17 +12,19 @@ semanal de auditoria.
 | Regla | Tipo (`AnomalyKind`) | Donde se configura |
 |---|---|---|
 | CPU sostenida por encima de un umbral | `cpu_sustained` | `[rules.cpu]` |
+| MemAvailable del host bajo durante un periodo configurable | `host_memory_pressure` | `[rules.host_memory]` |
 | RSS de un proceso fuera de rango | `memory_out_of_range` | `[rules.memory]` |
 | Proceso corriendo como root fuera de whitelist (excluye kernel threads, ver mas abajo) | `root_not_whitelisted` | `[rules.root_whitelist]` |
 | Proceso que vive menos de N segundos (cryptominer/malware efimero) | `ephemeral_process` | `[rules.ephemeral]` |
 | Puerto nuevo en LISTEN/bindeado (tcp/tcp6/udp/udp6) | `nuevo_puerto_listen` | `[network]`, deshabilitado por defecto |
 | Conexion TCP saliente ESTABLISHED fuera de los CIDRs/puertos esperados (solo IPv4) | `conexion_saliente_no_esperada` | `[network]`, deshabilitado por defecto |
 
-Todas comparten el mismo `cooldown_secs` por (pid, tipo) y el mismo pool de
-workers que ejecuta `audit_script_path`. Las notificaciones de Telegram
-(`[telegram]`) son ortogonales a todo esto: si estan habilitadas, cualquiera
-de las anomalias de arriba dispara ademas un mensaje 🚨, sin cambiar la
-logica de deteccion.
+El cooldown se confirma despues de enviar por Telegram; una cola llena o un
+fallo de envio no lo consume. Las reglas por proceso usan `(PID, starttime,
+tipo)`; memoria del host tiene una clave independiente y root se agrupa por
+contexto. Las notificaciones de memoria tienen cola e hilo reservados, y los
+scripts corren en otro pool con timeout. Telegram es opcional; si esta
+inactivo, el evento se registra localmente y ese registro inicia el cooldown.
 
 Aparte del motor de reglas hay un monitor de **logins SSH exitosos**
 (`[ssh_watch]`, deshabilitado por defecto) que no hace polling de `/proc`:
@@ -40,7 +42,8 @@ panoptesd/
 │   ├── config.rs       # carga y structs de configuracion (TOML)
 │   ├── process.rs      # parseo manual de /proc/<pid>/stat, estado por proceso
 │   ├── rules.rs         # tipos de anomalia y evaluacion de reglas
-│   ├── trigger.rs       # cooldown + pool de hilos que ejecutan el script
+│   ├── trigger.rs       # entrega, cooldown y pool separado de auditoria
+│   ├── root_events.rs   # agrupacion de auxiliares por ejecutable/ascendencia
 │   ├── network.rs       # correlacion opcional de sockets (/proc/net/tcp)
 │   ├── userdb.rs        # cache uid -> username (/etc/passwd)
 │   ├── signals.rs       # SIGTERM/SIGINT y sleep interrumpible
@@ -61,8 +64,8 @@ panoptesd/
 
 ## Por que este stack
 
-- **Sin `procfs` ni `sysinfo`**: solo necesitamos 4 campos de un unico
-  archivo por proceso (`/proc/<pid>/stat`: comm, utime, stime, rss) mas el
+- **Sin `procfs` ni `sysinfo`**: leemos los campos necesarios de
+  `/proc/<pid>/stat` (comm, CPU, RSS, padre, grupo, inicio, flags), exe y el
   uid (gratis, via metadata del directorio `/proc/<pid>`). Parsear a mano
   con un buffer de `String` reutilizado y un array fijo en stack (sin
   `Vec` por proceso) es mas liviano que pasar por la capa de abstraccion
@@ -188,23 +191,63 @@ kernel threads ahi (`kworker/*`, `irq/*`, `ksoftirqd/*`, `migration/*`,
 `kswapd0`, threads de drivers como `card1-crtc*`, etc.): el daemon los
 excluye automaticamente de esta regla antes de mirar el nombre, porque
 tienen nombres dinamicos que no se pueden whitelistear uno por uno. Un
-proceso se clasifica como kernel thread (y se salta `root_not_whitelisted`,
-aunque sigue evaluado por CPU/memoria) si cumple cualquiera de:
+proceso se clasifica como kernel thread por `PF_KTHREAD` en los flags de
+`/proc/PID/stat`. Un `exe` borrado/inaccesible sigue siendo evaluado; PPID 2
+por si solo tampoco demuestra que sea un hilo del kernel.
 
-1. Es hijo directo de `kthreadd` (`PPID == 2`).
-2. `/proc/<pid>/exe` no resuelve a un binario real (falla, o el symlink
-   esta borrado).
+Las alertas root se agrupan durante `group_window_secs` (10s por defecto).
+Los descendientes de APT/dpkg/PackageKit se relacionan por ascendencia e
+instancia del padre: se valida la ruta de `/proc/PID/exe` contra rutas
+concretas de esos gestores, propiedad root y ausencia de escritura para
+grupo/otros en el ejecutable y sus directorios. Esto **no autoriza** el
+proceso: envia un resumen del grupo. Fuera de ese contexto, se agrupan
+solo ejecutable + comm + instancia del padre; sin evidencia suficiente,
+la identidad es PID+inicio. Un falso `apt-get` en `/tmp` no hereda contexto.
 
-Este filtro fue necesario porque en una prueba real (escritorio con GPU
-AMD) la regla, tal como estaba, disparo ~377 auditorias en 2 minutos
-solo por los kernel threads de video/scheduler del kernel — ver
-`CHANGELOG.md` para el detalle. En un servidor sin
-esa carga de drivers de escritorio el volumen deberia ser mucho menor,
-pero conviene tenerlo presente al calibrar un servidor nuevo: si
-`root_not_whitelisted` dispara mucho al arrancar, revisar primero si son
-procesos de usuario reales faltantes en `allowed_names` (agregarlos) o
-si aun asi hay ruido (reportar, seria un caso no cubierto por el filtro
-de kernel threads).
+Cada integrante distinto queda con PID, starttime, comm, exe y PPID en
+journal/log. Telegram muestra hasta ocho ejemplos por grupo. Se retienen
+los eventos de procesos ya terminados hasta poder encolarlos. Un grupo
+persistente vuelve a alertar tras `cooldown_secs`; una actividad no
+relacionada tiene su propia clave. No se agregaron interpretes ni utilidades
+genericas a `allowed_names`. Esa whitelist previa sigue basandose en comm
+(y por tanto puede ser suplantada); no debe ampliarse para callar ruido.
+
+La memoria de agrupacion esta acotada a 512 contextos mas un grupo de
+desborde, con 128 identidades por grupo. Si se supera, se registra la
+saturacion y cada observacion adicional en log; Telegram incluye el conteo.
+
+El pool registra el grupo de procesos de cada auditoria que **el propio
+daemon lanza**, incluyendo sus auxiliares. Solo se excluyen root/efimero
+en ese contexto. CPU, RSS y red siguen evaluandose, pero sus alertas no
+lanzan otra auditoria recursiva. No se confia en variables de entorno ni
+en el nombre `auditoria.sh`. Una ejecucion manual o un script semanal
+externo sigue vigilado. `audit_timeout_secs` (30s) limita las auditorias;
+al terminar se mata su grupo, por lo que no deben dejar tareas en background.
+
+### Memoria: RSS, host y limites de cgroup
+
+`rules.memory.max_rss_mb` es **RSS por proceso en MiB**, sin sumar hijos ni
+swap. El ejemplo usa 768 MiB como punto de partida a ajustar al servicio,
+RAM y limites reales. El valor anterior (2048 MiB) supera los ~1.9 GiB de
+RAM que aparecen en el archivo de alertas; no era un umbral preventivo
+adecuado para ese host.
+
+`rules.host_memory` lee `MemAvailable` y `MemTotal` en cada polling. Alerta
+cuando la disponibilidad es menor que `min_available_mb` **o**
+`min_available_percent` durante `sustained_secs`. Defaults: 256 MiB, 15%,
+10s, habilitada incluso si falta la seccion en una config antigua. Un cero
+desactiva ese umbral; ambos en cero son invalidos si la regla esta activa.
+Una recuperacion o una lectura ausente reinicia la duracion sostenida.
+Con polling de 5s y duracion de 10s, la deteccion tarda aproximadamente
+10..15s mas la latencia de envio si el daemon puede muestrear a tiempo.
+El arranque registra umbrales efectivos y RAM, y avisa si RSS >= RAM.
+
+No es garantia contra OOM: un pico entre muestras, un agotamiento rapido,
+o `memory.max` de un cgroup menor a la RAM pueden adelantarse. La regla
+host no detecta presion localizada dentro de un cgroup. El script captura
+meminfo, swap, PSI, mayores RSS, OOM reciente y limites/eventos cgroup v2
+incluidos sus ancestros, para diagnostico. Los contadores y una instantanea
+posterior no reconstruyen por si solos el pico historico.
 
 ### Reglas de red (`[network]`, opcional)
 
@@ -237,7 +280,7 @@ Dos reglas independientes, ambas gateadas por el mismo
   alto) tiene que seguir llegando a la whitelist.
 
 Ambas reparten el mismo mapeo inodo->pid (el paso costoso) y usan el mismo
-`cooldown_secs` por (pid, tipo) que el resto de las reglas.
+`cooldown_secs` por (PID, inicio, tipo) que las demas reglas por proceso.
 
 ## Notificaciones por Telegram
 
@@ -269,12 +312,11 @@ lleva un encabezado distinto para distinguirlos de un vistazo en el chat:
    `enabled = true` y ajustar `status_interval_hours`,
    `weekly_summary_day`/`weekly_summary_hour` y `disk_paths` segun
    necesites (ver `config/config.example.toml`).
-5. `sudo systemctl restart panoptesd.service`. Si el token/chat_id faltan
-   o son invalidos, el daemon arranca igual: se loguea un error y Telegram
-   queda deshabilitado para esa corrida (nunca es motivo de caida).
+5. `sudo systemctl restart panoptesd.service`. Si faltan token/chat_id, el daemon falla al iniciar con un error claro.
+   Credenciales rechazadas por la API producen errores de envio visibles en log.
 
 El envio HTTP a la API de Telegram (via `ureq`, sincrono) corre solo en los
-hilos de los workers de auditoria y en los dos hilos de los schedulers —
+hilos de notificacion y de los schedulers —
 nunca en el loop principal de polling de `/proc`, asi que un timeout o una
 caida de red hacia Telegram no afecta la deteccion de anomalias.
 
@@ -367,7 +409,8 @@ servidor de produccion:
    proposito: `poll_interval_secs=2`, `cpu.threshold_percent=5.0`,
    `cpu.sustained_secs=5`). Los valores de referencia para produccion son
    los del ejemplo: `poll_interval_secs=5`, `cooldown_secs=300`,
-   `cpu.threshold_percent=85.0` sostenido `60s`, `memory.max_rss_mb=2048`,
+   `cpu.threshold_percent=85.0` sostenido `60s`, `memory.max_rss_mb=768` (ajustar al workload),
+   `host_memory.min_available_mb=256`, `min_available_percent=15`, `sustained_secs=10`,
    `ephemeral.max_lifetime_secs=2`.
 2. **`allowed_names` de `root_whitelist`**: revisar que binarios propios de
    ese servidor corren como root ademas de los 11 ya listados (por
@@ -422,3 +465,34 @@ servidor de produccion:
   relanzar. Solo cubre `password` y `publickey`; otros metodos
   (`keyboard-interactive`, certificados via `publickey` si aparecen con
   ese nombre, etc.) no disparan alerta.
+
+## Entrega, pruebas y diagnostico del incidente de Polybot
+
+Las alertas intentan enviar hasta tres veces (esperas de 1 y 2 segundos),
+validando HTTP y `ok=true` de la API antes de confirmar cooldown. Los errores
+no incluyen URLs con tokens. Un evento en vuelo se deduplica; si falla, una
+condicion persistente se vuelve a evaluar sin esperar el cooldown. El limite
+aplica por regla: root nunca consume el cooldown de RSS o memoria del host.
+El pool de auditoria puede estar ocupado sin detener las notificaciones.
+
+Las colas son acotadas (256 normales, 64 de memoria, 256 auditorias).
+Un rechazo queda en log y no consume cooldown. No hay outbox persistente:
+un fallo prolongado, agotamiento de colas o un reinicio puede perder eventos
+transitorios. Tampoco se garantiza exactamente una entrega: si Telegram
+acepta pero se pierde su respuesta, un reintento puede duplicar el aviso.
+El historial semanal refleja auditorias, no confirma recepcion del usuario;
+la confirmacion de entrega queda explicitamente en journal.
+
+```bash
+cargo fmt --check
+cargo test --locked
+cargo clippy --locked --all-targets -- -D warnings
+bash -n scripts/auditoria.sh
+```
+
+Las pruebas usan fixtures de /proc y una API HTTP simulada en localhost,
+**sin enviar mensajes al bot real**. Cubren actualizacion de paquetes,
+root inesperado, auditoria sin recursion, presion sostenida, umbrales,
+reintentos, separacion de colas y cooldown tras confirmacion.
+
+Ver [informe de evidencia y pendientes](docs/diagnostico-polybot.md).
