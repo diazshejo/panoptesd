@@ -1,0 +1,2 @@
+# Solo resultados fijos de backup: no permite enviar texto arbitrario ni leer secretos.
+deploy ALL=(root) NOPASSWD: /usr/bin/systemctl start panoptesd-backup-notify@manual-success.service, /usr/bin/systemctl start panoptesd-backup-notify@manual-failure.service, /usr/bin/systemctl start panoptesd-backup-notify@test.service
